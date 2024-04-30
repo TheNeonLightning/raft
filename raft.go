@@ -8,6 +8,8 @@ import (
 	"container/list"
 	"fmt"
 	"io"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +22,41 @@ const (
 	minCheckInterval       = 10 * time.Millisecond
 	oldestLogGaugeInterval = 10 * time.Second
 )
+
+type ElectionPolicy uint32
+
+const (
+	ElectionsWon ElectionPolicy = iota
+	LogsCommited
+)
+
+type electionState struct {
+	electionTerm     uint64
+	electionLock     sync.Mutex
+	electionActive   sync.Cond
+	electionRelevant bool
+	electionReady    bool
+
+	candidates     []*RequestVoteRequest
+	candidatesRPCs map[*RequestVoteRequest]RPC
+}
+
+func makeElectionState(rpc RPC, req *RequestVoteRequest) *electionState {
+	es := electionState{
+		electionTerm:     req.Term,
+		electionLock:     sync.Mutex{},
+		electionRelevant: true,
+		electionReady:    false,
+
+		candidates:     make([]*RequestVoteRequest, 0),
+		candidatesRPCs: make(map[*RequestVoteRequest]RPC),
+	}
+	es.electionActive = *sync.NewCond(&es.electionLock)
+
+	es.candidates = append(es.candidates, req)
+	es.candidatesRPCs[req] = rpc
+	return &es
+}
 
 var (
 	keyCurrentTerm  = []byte("CurrentTerm")
@@ -289,9 +326,9 @@ func (r *Raft) runCandidate() {
 	voteCh := r.electSelf()
 
 	// Make sure the leadership transfer flag is reset after each run. Having this
-	// flag will set the field LeadershipTransfer in a RequestVoteRequst to true,
+	// flag will set the field LeadershipTransfer in a RequestVoteRequest to true,
 	// which will make other servers vote even though they have a leader already.
-	// It is important to reset that flag, because this priviledge could be abused
+	// It is important to reset that flag, because this privilege could be abused
 	// otherwise.
 	defer func() { r.candidateFromLeadershipTransfer.Store(false) }()
 
@@ -332,6 +369,7 @@ func (r *Raft) runCandidate() {
 				r.logger.Info("election won", "term", vote.Term, "tally", grantedVotes)
 				r.setState(Leader)
 				r.setLeader(r.localAddr, r.localID)
+				r.setElectionsWon(r.getElectionsWon() + 1)
 				return
 			}
 
@@ -739,6 +777,7 @@ func (r *Raft) leaderLoop() {
 			// Process the newly committed entries
 			oldCommitIndex := r.getCommitIndex()
 			commitIndex := r.leaderState.commitment.getCommitIndex()
+			r.setLogsCommited(r.getLogsCommited() + commitIndex - oldCommitIndex)
 			r.setCommitIndex(commitIndex)
 
 			// New configuration has been committed, set it as the committed
@@ -1036,13 +1075,17 @@ func (r *Raft) checkLeaderLease() time.Duration {
 // the main thread.
 // TODO: revisit usage
 func (r *Raft) quorumSize() int {
+	return r.clusterSize()/2 + 1
+}
+
+func (r *Raft) clusterSize() int {
 	voters := 0
 	for _, server := range r.configurations.latest.Servers {
 		if server.Suffrage == Voter {
 			voters++
 		}
 	}
-	return voters/2 + 1
+	return voters
 }
 
 // restoreUserSnapshot is used to manually consume an external snapshot, such
@@ -1553,36 +1596,25 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
 	r.observe(*req)
 
-	// Setup a response
-	resp := &RequestVoteResponse{
-		RPCHeader: r.getRPCHeader(),
-		Term:      r.getCurrentTerm(),
-		Granted:   false,
-	}
-	var rpcErr error
+	denyVote := true
 	defer func() {
-		rpc.Respond(resp, rpcErr)
+		if denyVote {
+			r.sendDeniedVote(rpc)
+		}
 	}()
-
-	// Version 0 servers will panic unless the peers is present. It's only
-	// used on them to produce a warning message.
-	if r.protocolVersion < 2 {
-		resp.Peers = encodePeers(r.configurations.latest, r.trans)
-	}
 
 	// Check if we have an existing leader [who's not the candidate] and also
 	// check the LeadershipTransfer flag is set. Usually votes are rejected if
 	// there is a known leader. But if the leader initiated a leadership transfer,
 	// vote!
-	var candidate ServerAddress
 	var candidateBytes []byte
+	var candidate ServerAddress
 	if len(req.RPCHeader.Addr) > 0 {
-		candidate = r.trans.DecodePeer(req.RPCHeader.Addr)
 		candidateBytes = req.RPCHeader.Addr
 	} else {
-		candidate = r.trans.DecodePeer(req.Candidate)
 		candidateBytes = req.Candidate
 	}
+	candidate = r.trans.DecodePeer(candidateBytes)
 
 	// For older raft version ID is not part of the packed message
 	// We assume that the peer is part of the configuration and skip this check
@@ -1615,7 +1647,6 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		r.logger.Debug("lost leadership because received a requestVote with a newer term")
 		r.setState(Follower)
 		r.setCurrentTerm(req.Term)
-		resp.Term = req.Term
 	}
 
 	// if we get a request for vote from a nonVoter  and the request term is higher,
@@ -1647,7 +1678,8 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
 		if bytes.Equal(lastVoteCandBytes, candidateBytes) {
 			r.logger.Warn("duplicate requestVote from", "candidate", candidate)
-			resp.Granted = true
+			// TODO sendGrantedVote() does persistVote() and lastContact() which were not here before
+			r.sendGrantedVote(rpc, req)
 		}
 		return
 	}
@@ -1670,6 +1702,113 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		return
 	}
 
+	denyVote = false
+	if r.electionState == nil || req.Term > r.electionState.electionTerm {
+		if r.electionState != nil {
+			r.electionState.electionActive.L.Lock()
+
+			r.electionState.electionRelevant = false // TODO variable mirrors newElection
+			r.electionState.electionReady = true
+			r.electionState.electionActive.Signal()
+
+			r.electionState.electionActive.L.Unlock()
+		}
+
+		r.electionState = makeElectionState(rpc, req)
+		go r.runElectionAfterDelay(r.electionState) // TODO might use goFunc instead
+	} else {
+		r.electionState.electionActive.L.Lock()
+
+		r.electionState.candidates = append(r.electionState.candidates, req)
+		r.electionState.candidatesRPCs[req] = rpc
+
+		if len(r.electionState.candidates) > r.clusterSize()/3 { // TODO can be immediately true on newElection
+			r.electionState.electionReady = true
+			r.electionState.electionActive.Signal()
+		}
+
+		r.electionState.electionActive.L.Unlock()
+	}
+}
+
+func (r *Raft) runElectionAfterDelay(election *electionState) {
+	go r.runElection(r.electionState) // TODO might use goFunc instead
+	time.Sleep(r.config().ElectionTimeout / 3)
+
+	election.electionActive.L.Lock()
+	election.electionReady = true
+	election.electionActive.Signal()
+	election.electionActive.L.Unlock()
+}
+
+// TODO derive less(left, right int) from electionPolicy
+// TODO do I need to construct resp for every candidate?
+// TODO use term from electionState
+func (r *Raft) runElection(election *electionState) {
+	election.electionActive.L.Lock()
+	defer election.electionActive.L.Unlock()
+
+	for election.electionRelevant && !election.electionReady {
+		election.electionActive.Wait()
+	}
+
+	if !election.electionRelevant {
+		for _, rpc := range election.candidatesRPCs {
+			r.sendDeniedVote(rpc)
+		}
+	}
+
+	sort.Slice(election.candidates, func(left, right int) bool {
+		if r.electionPolicy == ElectionsWon {
+			return election.candidates[left].ElectionsWon > election.candidates[right].ElectionsWon
+		}
+		return election.candidates[left].LogsCommited > election.candidates[right].LogsCommited
+	})
+
+	for candidateIndex := 1; candidateIndex < len(election.candidates); candidateIndex++ {
+		r.sendDeniedVote(election.candidatesRPCs[election.candidates[candidateIndex]])
+	}
+	r.sendGrantedVote(election.candidatesRPCs[election.candidates[0]], election.candidates[0])
+	// TODO clear electionState
+}
+
+func (r *Raft) sendDeniedVote(rpc RPC) {
+	resp := &RequestVoteResponse{
+		RPCHeader: r.getRPCHeader(),
+		Term:      r.getCurrentTerm(),
+		Granted:   false,
+	}
+
+	// Version 0 servers will panic unless the peers is present. It's only
+	// used on them to produce a warning message.
+	if r.protocolVersion < 2 {
+		resp.Peers = encodePeers(r.configurations.latest, r.trans)
+	}
+
+	var rpcErr error
+	rpc.Respond(resp, rpcErr)
+}
+
+func (r *Raft) sendGrantedVote(rpc RPC, req *RequestVoteRequest) {
+	resp := &RequestVoteResponse{
+		RPCHeader: r.getRPCHeader(),
+		Term:      r.getCurrentTerm(),
+		Granted:   true,
+	}
+
+	// Version 0 servers will panic unless the peers is present. It's only
+	// used on them to produce a warning message.
+	if r.protocolVersion < 2 {
+		resp.Peers = encodePeers(r.configurations.latest, r.trans)
+	}
+
+	var candidateBytes []byte
+	if len(req.RPCHeader.Addr) > 0 {
+		candidateBytes = req.RPCHeader.Addr
+	} else {
+		candidateBytes = req.Candidate
+	}
+
 	// Persist a vote for safety
 	if err := r.persistVote(req.Term, candidateBytes); err != nil {
 		r.logger.Error("failed to persist vote", "error", err)
@@ -1678,6 +1817,9 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 	resp.Granted = true
 	r.setLastContact()
+
+	var rpcErr error
+	rpc.Respond(resp, rpcErr)
 }
 
 // installSnapshot is invoked when we get a InstallSnapshot RPC call.
@@ -1857,6 +1999,8 @@ func (r *Raft) electSelf() <-chan *voteResult {
 		Candidate:          r.trans.EncodePeer(r.localID, r.localAddr),
 		LastLogIndex:       lastIdx,
 		LastLogTerm:        lastTerm,
+		ElectionsWon:       r.getElectionsWon(),
+		LogsCommited:       r.getLogsCommited(),
 		LeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),
 	}
 

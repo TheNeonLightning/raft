@@ -113,6 +113,9 @@ type Raft struct {
 	// fsmSnapshotCh is used to trigger a new snapshot being taken
 	fsmSnapshotCh chan *reqSnapshotFuture
 
+	electionPolicy ElectionPolicy
+	electionState  *electionState
+
 	// lastContact is the last time we had contact from the
 	// leader node. This can be used to gauge staleness.
 	lastContact     time.Time
@@ -538,6 +541,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		fsm:                   fsm,
 		fsmMutateCh:           make(chan interface{}, 128),
 		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
+		electionPolicy:        LogsCommited, // TODO add to config
 		leaderCh:              make(chan bool, 1),
 		localID:               localID,
 		localAddr:             localAddr,

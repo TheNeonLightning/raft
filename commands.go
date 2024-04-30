@@ -88,6 +88,9 @@ type RequestVoteRequest struct {
 	LastLogIndex uint64
 	LastLogTerm  uint64
 
+	ElectionsWon uint64
+	LogsCommited uint64
+
 	// Used to indicate to peers if this vote was triggered by a leadership
 	// transfer. It is required for leadership transfer to work, because servers
 	// wouldn't vote otherwise if they are aware of an existing leader.
