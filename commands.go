@@ -42,6 +42,10 @@ type AppendEntriesRequest struct {
 
 	// Commit index on the leader
 	LeaderCommitIndex uint64
+
+	LogsCommitedCurrent uint64
+	ProcessingCapacity  uint64
+	NetworkMeasurement  uint64
 }
 
 // GetRPCHeader - See WithRPCHeader.
@@ -66,6 +70,8 @@ type AppendEntriesResponse struct {
 	// There are scenarios where this request didn't succeed
 	// but there's no need to wait/back-off the next attempt.
 	NoRetryBackoff bool
+
+	NegativeVote bool
 }
 
 // GetRPCHeader - See WithRPCHeader.
@@ -88,8 +94,8 @@ type RequestVoteRequest struct {
 	LastLogIndex uint64
 	LastLogTerm  uint64
 
-	ElectionsWon uint64
-	LogsCommited uint64
+	ElectionsWon      uint64
+	LogsCommitedTotal uint64
 
 	// Used to indicate to peers if this vote was triggered by a leadership
 	// transfer. It is required for leadership transfer to work, because servers

@@ -69,9 +69,9 @@ type raftState struct {
 	lastLogIndex uint64
 	lastLogTerm  uint64
 
-	electionsWon uint64
-
-	logsCommited uint64
+	electionsWon        uint64
+	logsCommitedTotal   uint64
+	logsCommitedCurrent uint64
 
 	// Tracks running goroutines
 	routinesGroup sync.WaitGroup
@@ -121,12 +121,20 @@ func (r *raftState) setElectionsWon(electionsWon uint64) {
 	atomic.StoreUint64(&r.electionsWon, electionsWon)
 }
 
-func (r *raftState) getLogsCommited() uint64 {
-	return atomic.LoadUint64(&r.logsCommited)
+func (r *raftState) getLogsCommitedTotal() uint64 {
+	return atomic.LoadUint64(&r.logsCommitedTotal)
 }
 
-func (r *raftState) setLogsCommited(logsCommited uint64) {
-	atomic.StoreUint64(&r.logsCommited, logsCommited)
+func (r *raftState) setLogsCommitedTotal(logsCommited uint64) {
+	atomic.StoreUint64(&r.logsCommitedTotal, logsCommited)
+}
+
+func (r *raftState) getLogsCommitedCurrent() uint64 {
+	return atomic.LoadUint64(&r.logsCommitedCurrent)
+}
+
+func (r *raftState) setLogsCommitedCurrent(logsCommited uint64) {
+	atomic.StoreUint64(&r.logsCommitedCurrent, logsCommited)
 }
 
 func (r *raftState) getLastSnapshot() (index, term uint64) {

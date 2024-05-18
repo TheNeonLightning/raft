@@ -116,6 +116,9 @@ type Raft struct {
 	electionPolicy ElectionPolicy
 	electionState  *electionState
 
+	oppositionPolicy OppositionPolicy
+	oppositionState  *oppositionState
+
 	// lastContact is the last time we had contact from the
 	// leader node. This can be used to gauge staleness.
 	lastContact     time.Time
@@ -519,6 +522,9 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 
 	// Make sure we have a valid server address and ID.
 	protocolVersion := conf.ProtocolVersion
+	electionPolicy := conf.ElectionPolicy
+	oppositionPolicy := conf.OppositionPolicy
+	oppositionInitialState := &oppositionState{lastNegativeVoteTerm: 0, oppositionThreshold: conf.OppositionThreshold}
 	localAddr := trans.LocalAddr()
 	localID := conf.LocalID
 
@@ -541,7 +547,9 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		fsm:                   fsm,
 		fsmMutateCh:           make(chan interface{}, 128),
 		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
-		electionPolicy:        LogsCommited, // TODO add to config
+		electionPolicy:        electionPolicy,
+		oppositionPolicy:      oppositionPolicy,
+		oppositionState:       oppositionInitialState,
 		leaderCh:              make(chan bool, 1),
 		localID:               localID,
 		localAddr:             localAddr,

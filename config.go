@@ -150,6 +150,10 @@ type Config struct {
 	// from a leader before we attempt an election.
 	HeartbeatTimeout time.Duration
 
+	ElectionPolicy      ElectionPolicy
+	OppositionPolicy    OppositionPolicy
+	OppositionThreshold uint64
+
 	// ElectionTimeout specifies the time in candidate state without contact
 	// from a leader before we attempt an election.
 	ElectionTimeout time.Duration

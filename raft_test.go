@@ -2879,9 +2879,11 @@ func TestRaft_VoteNotGranted_WhenNodeNotInCluster(t *testing.T) {
 	}
 }
 
-func TestRaft_CustomTest(t *testing.T) {
+func TestRaft_VoteForBestCandidateLogsCommited(t *testing.T) {
 	// Make a cluster
-	c := MakeCluster(5, t, nil)
+	conf := inmemConfig(t)
+	conf.ElectionPolicy = LogsCommited
+	c := MakeCluster(5, t, conf)
 
 	defer c.Close()
 
@@ -2899,65 +2901,161 @@ func TestRaft_CustomTest(t *testing.T) {
 		t.Fatalf("expected two followers: %v", followers)
 	}
 
-	// Remove a follower
-	followerRemoved := followers[0]
-	future := leader.RemoveServer(followerRemoved.localID, 0, 0)
-	if err := future.Error(); err != nil {
-		t.Fatalf("err: %v", err)
+	votingFollower := followers[3]
+	var reqVote [3]RequestVoteRequest
+	electionTerm := votingFollower.getCurrentTerm() + 10
+	for index := 0; index < 3; index++ {
+		reqVote[index] = RequestVoteRequest{
+			RPCHeader:          followers[index].getRPCHeader(),
+			Term:               electionTerm,
+			LastLogIndex:       followers[index].LastIndex(),
+			LastLogTerm:        followers[index].getCurrentTerm(),
+			LeadershipTransfer: false,
+		}
 	}
+	reqVote[0].ElectionsWon = 4
+	reqVote[1].ElectionsWon = 6
+	reqVote[2].ElectionsWon = 8
+	reqVote[0].LogsCommited = 20
+	reqVote[1].LogsCommited = 21
+	reqVote[2].LogsCommited = 22
 
-	// Wait a while
+	var resp [3]RequestVoteResponse
+
+	c.logger.Info("[TEST] voting follower disconnected from leader")
+	c.trans[c.IndexOf(votingFollower)].Disconnect(leader.localAddr)
+	c.trans[c.IndexOf(leader)].Disconnect(votingFollower.localAddr)
 	time.Sleep(c.propagateTimeout)
-
-	// Other nodes should have fewer peers
-	if configuration := c.getConfiguration(leader); len(configuration.Servers) != 2 {
-		t.Fatalf("too many peers")
-	}
-	if configuration := c.getConfiguration(followers[1]); len(configuration.Servers) != 2 {
-		t.Fatalf("too many peers")
-	}
-	waitForState(followerRemoved, Follower)
-	// The removed node should be still in Follower state
-	require.Equal(t, Follower, followerRemoved.getState())
-
-	// Prepare a Vote request from the removed follower
-	follower := followers[1]
-	followerRemovedT := c.trans[c.IndexOf(followerRemoved)]
-	reqVote := RequestVoteRequest{
-		RPCHeader:          followerRemoved.getRPCHeader(),
-		Term:               followerRemoved.getCurrentTerm() + 10,
-		LastLogIndex:       followerRemoved.LastIndex(),
-		LastLogTerm:        followerRemoved.getCurrentTerm(),
-		LeadershipTransfer: false,
-	}
-	// a follower that thinks there's a leader should vote for that leader.
-	var resp RequestVoteResponse
-
-	// partition the leader to simulate an unstable cluster
-	c.Partition([]ServerAddress{leader.localAddr})
-	time.Sleep(c.propagateTimeout)
+	c.logger.Info("[TEST]", "disconnected leader", leader.localAddr, "voter", votingFollower.localAddr)
 
 	// wait for the remaining follower to trigger an election
-	waitForState(follower, Candidate)
-	require.Equal(t, Candidate, follower.getState())
+	waitForState(votingFollower, Candidate)
+	require.Equal(t, Candidate, votingFollower.getState())
 
-	// send a vote request from the removed follower to the Candidate follower
-	if err := follower0.RequestVote(follower.localID, follower.localAddr, &reqVote, &resp); err != nil {
-		t.Fatalf("RequestVote RPC failed %v", err)
-	}
-	if err := follower1.RequestVote(follower.localID, follower.localAddr, &reqVote, &resp); err != nil {
-		t.Fatalf("RequestVote RPC failed %v", err)
-	}
-	if err := follower2.RequestVote(follower.localID, follower.localAddr, &reqVote, &resp); err != nil {
-		t.Fatalf("RequestVote RPC failed %v", err)
-	}
-	if err := follower3.RequestVote(follower.localID, follower.localAddr, &reqVote, &resp); err != nil {
-		t.Fatalf("RequestVote RPC failed %v", err)
+	var routinesGroup sync.WaitGroup
+	askPeer := func(followerTrans LoopbackTransport, req RequestVoteRequest, resp *RequestVoteResponse) {
+		if err := followerTrans.RequestVote(votingFollower.localID, votingFollower.localAddr, &req, resp); err != nil {
+			t.Fatalf("RequestVote RPC failed %v", err)
+		}
+		routinesGroup.Done()
 	}
 
-	// the vote request should not be granted, because the voter is not part of the cluster anymore
-	if resp.Granted {
-		t.Fatalf("expected vote to not be granted, but it was %+v", resp)
+	c.logger.Info("[TEST] sending requests", "term", electionTerm)
+
+	routinesGroup.Add(1)
+	followerTrans := c.trans[c.IndexOf(followers[0])]
+	go askPeer(followerTrans, reqVote[0], &resp[0])
+
+	routinesGroup.Add(1)
+	followerTrans = c.trans[c.IndexOf(followers[1])]
+	go askPeer(followerTrans, reqVote[1], &resp[1])
+
+	time.Sleep(conf.ElectionTimeout / 8)
+
+	routinesGroup.Add(1)
+	followerTrans = c.trans[c.IndexOf(followers[2])]
+	go askPeer(followerTrans, reqVote[2], &resp[2])
+
+	routinesGroup.Wait()
+
+	if resp[0].Granted {
+		t.Fatalf("Follower 0: expected vote to not be granted, but it was %+v", resp)
+	}
+	if !resp[1].Granted {
+		t.Fatalf("Follower 1: expected vote to be granted, but it was not %+v", resp)
+	}
+	if resp[2].Granted {
+		t.Fatalf("Follower 2: expected vote to not be granted, but it was %+v", resp)
+	}
+}
+
+func TestRaft_VoteForBestCandidateElectionsWon(t *testing.T) {
+	// Make a cluster
+	conf := inmemConfig(t)
+	conf.ElectionPolicy = ElectionsWon
+	c := MakeCluster(5, t, conf)
+
+	defer c.Close()
+
+	// Get the leader
+	leader := c.Leader()
+
+	// Wait until we have 4 followers
+	limit := time.Now().Add(c.longstopTimeout)
+	var followers []*Raft
+	for time.Now().Before(limit) && len(followers) != 4 {
+		c.WaitEvent(nil, c.conf.CommitTimeout)
+		followers = c.GetInState(Follower)
+	}
+	if len(followers) != 4 {
+		t.Fatalf("expected two followers: %v", followers)
+	}
+
+	votingFollower := followers[3]
+	var reqVote [3]RequestVoteRequest
+	electionTerm := votingFollower.getCurrentTerm() + 10
+	for index := 0; index < 3; index++ {
+		reqVote[index] = RequestVoteRequest{
+			RPCHeader:          followers[index].getRPCHeader(),
+			Term:               electionTerm,
+			LastLogIndex:       followers[index].LastIndex(),
+			LastLogTerm:        followers[index].getCurrentTerm(),
+			LeadershipTransfer: false,
+		}
+	}
+	reqVote[0].ElectionsWon = 4
+	reqVote[1].ElectionsWon = 6
+	reqVote[2].ElectionsWon = 8
+	reqVote[0].LogsCommited = 20
+	reqVote[1].LogsCommited = 21
+	reqVote[2].LogsCommited = 22
+
+	var resp [3]RequestVoteResponse
+
+	c.logger.Info("[TEST] voting follower disconnected from leader")
+	c.trans[c.IndexOf(votingFollower)].Disconnect(leader.localAddr)
+	c.trans[c.IndexOf(leader)].Disconnect(votingFollower.localAddr)
+	time.Sleep(c.propagateTimeout)
+	c.logger.Info("[TEST]", "disconnected leader", leader.localAddr, "voter", votingFollower.localAddr)
+
+	// wait for the remaining follower to trigger an election
+	waitForState(votingFollower, Candidate)
+	require.Equal(t, Candidate, votingFollower.getState())
+
+	var routinesGroup sync.WaitGroup
+	askPeer := func(followerTrans LoopbackTransport, req RequestVoteRequest, resp *RequestVoteResponse) {
+		if err := followerTrans.RequestVote(votingFollower.localID, votingFollower.localAddr, &req, resp); err != nil {
+			t.Fatalf("RequestVote RPC failed %v", err)
+		}
+		routinesGroup.Done()
+	}
+
+	c.logger.Info("[TEST] sending requests", "term", electionTerm)
+
+	routinesGroup.Add(1)
+	followerTrans := c.trans[c.IndexOf(followers[0])]
+	go askPeer(followerTrans, reqVote[0], &resp[0])
+
+	routinesGroup.Add(1)
+	followerTrans = c.trans[c.IndexOf(followers[1])]
+	go askPeer(followerTrans, reqVote[1], &resp[1])
+
+	time.Sleep(conf.ElectionTimeout / 8)
+
+	routinesGroup.Add(1)
+	followerTrans = c.trans[c.IndexOf(followers[2])]
+	go askPeer(followerTrans, reqVote[2], &resp[2])
+
+	routinesGroup.Wait()
+
+	if resp[0].Granted {
+		t.Fatalf("Follower 0: expected vote to not be granted, but it was %+v", resp)
+	}
+	if !resp[1].Granted {
+		t.Fatalf("Follower 1: expected vote to be granted, but it was not %+v", resp)
+	}
+	if resp[2].Granted {
+		t.Fatalf("Follower 2: expected vote to not be granted, but it was %+v", resp)
 	}
 }
 
