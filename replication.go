@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/pbnjay/memory"
 )
 
 const (
@@ -239,6 +240,12 @@ START:
 	if resp.Term > req.Term {
 		r.handleStaleTerm(s)
 		return true
+	}
+
+	if resp.NegativeVote {
+		if r.handleNegativeVote(s) {
+			return true
+		}
 	}
 
 	// Update the last contact
@@ -541,6 +548,12 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 				return
 			}
 
+			if resp.NegativeVote {
+				if r.handleNegativeVote(s) {
+					return
+				}
+			}
+
 			// Update the last contact
 			s.setLastContact()
 
@@ -564,6 +577,9 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequ
 	// this is needed for retro compatibility, before RPCHeader.Addr was added
 	req.Leader = r.trans.EncodePeer(r.localID, r.localAddr)
 	req.LeaderCommitIndex = r.getCommitIndex()
+	req.LogsCommitedCurrent = r.getLogsCommitedCurrent()
+	req.TotalMemory = memory.TotalMemory()
+	req.AvgLogCommitTime = r.getAvgLogCommitTime()
 	if err := r.setPreviousLog(req, nextIndex); err != nil {
 		return err
 	}
@@ -635,6 +651,19 @@ func (r *Raft) handleStaleTerm(s *followerReplication) {
 	r.logger.Error("peer has newer term, stopping replication", "peer", s.peer)
 	s.notifyAll(false) // No longer leader
 	asyncNotifyCh(s.stepDown)
+}
+
+func (r *Raft) handleNegativeVote(s *followerReplication) (shouldStop bool) {
+	oppositionSize := atomic.LoadInt32(&r.leaderState.oppositionSize) + 1
+	r.logger.Info("[OPPOSITION] Leader received negative vote", "opposition size", oppositionSize)
+	if int(oppositionSize) >= r.quorumSize() {
+		r.logger.Info("[OPPOSITION] Opposition reached quorum, leader stepping down")
+		s.notifyAll(false) // No longer leader
+		asyncNotifyCh(s.stepDown)
+		return true
+	}
+	atomic.StoreInt32(&r.leaderState.oppositionSize, oppositionSize)
+	return false
 }
 
 // updateLastAppended is used to update follower replication state after a

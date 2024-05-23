@@ -8,6 +8,7 @@ require (
 	github.com/armon/go-metrics v0.4.1
 	github.com/hashicorp/go-hclog v1.6.2
 	github.com/hashicorp/go-msgpack/v2 v2.1.1
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/stretchr/testify v1.8.4
 )
 

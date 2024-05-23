@@ -50,6 +50,11 @@ const (
 )
 
 type oppositionState struct {
+	backoffInitialDuration time.Duration
+	backoffCurrentDuration time.Duration
+	backoffDuration        time.Duration
+	backoffTimeout         time.Time
+
 	lastNegativeVoteTerm uint64
 	oppositionThreshold  uint64
 }
@@ -1305,7 +1310,7 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	// Reject logs we've applied already
 	lastApplied := r.getLastApplied()
 	if index <= lastApplied {
-		r.logger.Warn("skipping application of old log", "index", index)
+		r.logger.Warn("skipping application of old log", "index", index, "lastApplied", lastApplied)
 		return
 	}
 
@@ -1584,22 +1589,33 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
 	}
 
-	if a.Term > r.oppositionState.lastNegativeVoteTerm {
-		var oppositionValue uint64
+	// TODO do we need to check follower state (is it determined by a check above?)
+	// TODO might not reach this section - if we return from function earlier
+	if a.Term > r.oppositionState.lastNegativeVoteTerm && time.Now().After(r.oppositionState.backoffTimeout) {
+		var leaderPerformance uint64
 		switch r.oppositionPolicy {
 		case ProcessingCapacity:
-			oppositionValue = 0
+			leaderPerformance = 0
 		case NetworkMeasurement:
-			oppositionValue = 0
+			leaderPerformance = 0
 		default:
-			oppositionValue = a.LogsCommitedCurrent
+			leaderPerformance = a.LogsCommitedCurrent
 		}
 
-		if oppositionValue > r.oppositionState.oppositionThreshold {
+		if leaderPerformance > r.oppositionState.oppositionThreshold {
+			r.logger.Info("[OPPOSITION] Opposition threshold reached, sending negative vote", "term", a.Term,
+				"oppositionPolicy", r.oppositionPolicy, "leaderPerformance", leaderPerformance,
+				"oppositionThreshold", r.oppositionState.oppositionThreshold)
 			resp.NegativeVote = true
+
+			if time.Now().Before(r.oppositionState.backoffTimeout.Add(r.oppositionState.backoffDuration)) {
+				r.oppositionState.backoffDuration *= 2
+			} else if r.oppositionState.backoffDuration > r.oppositionState.backoffInitialDuration {
+				r.oppositionState.backoffDuration /= 2
+			}
+			r.oppositionState.backoffTimeout = time.Now().Add(r.oppositionState.backoffDuration)
 			r.oppositionState.lastNegativeVoteTerm = a.Term
 		}
-		resp.NegativeVote = oppositionValue > r.oppositionState.oppositionThreshold
 	}
 
 	// Everything went well, set success

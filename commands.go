@@ -44,8 +44,8 @@ type AppendEntriesRequest struct {
 	LeaderCommitIndex uint64
 
 	LogsCommitedCurrent uint64
-	ProcessingCapacity  uint64
-	NetworkMeasurement  uint64
+	AvgLogCommitTime    uint64
+	TotalMemory         uint64
 }
 
 // GetRPCHeader - See WithRPCHeader.

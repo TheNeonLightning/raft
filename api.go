@@ -524,7 +524,16 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	protocolVersion := conf.ProtocolVersion
 	electionPolicy := conf.ElectionPolicy
 	oppositionPolicy := conf.OppositionPolicy
-	oppositionInitialState := &oppositionState{lastNegativeVoteTerm: 0, oppositionThreshold: conf.OppositionThreshold}
+	backoffInitialDuration := time.Duration(conf.OppositionBackoffDurationSeconds * uint64(time.Second))
+	oppositionInitialState := &oppositionState{
+		backoffInitialDuration: backoffInitialDuration,
+		backoffCurrentDuration: backoffInitialDuration,
+		backoffTimeout:         time.Now(),
+		backoffIncreaseTimeout: time.Now(),
+
+		lastNegativeVoteTerm: 0,
+		oppositionThreshold:  conf.OppositionThreshold,
+	}
 	localAddr := trans.LocalAddr()
 	localID := conf.LocalID
 
