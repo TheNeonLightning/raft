@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"container/list"
 	"fmt"
+	linuxproc "github.com/c9s/goprocinfo/linux"
 	"io"
 	"sort"
 	"sync"
@@ -26,53 +27,59 @@ const (
 type ElectionPolicy uint32
 
 const (
-	LogsCommitedTotal ElectionPolicy = iota
-	ElectionsWon
+	ElectionsWonElc ElectionPolicy = iota
+	LogsCommitedTotalElc
+
+	FreeMemoryElc
+	LogCommitTimeElc
 )
 
 type electionState struct {
 	electionTerm     uint64
-	electionLock     sync.Mutex
-	electionActive   sync.Cond
-	electionRelevant bool
-	electionReady    bool
+	electionLock     *sync.Mutex
+	electionActive   *sync.Cond
+	electionRelevant *bool
+	electionReady    *bool
 
-	candidates     []*RequestVoteRequest
-	candidatesRPCs map[*RequestVoteRequest]RPC
+	candidates     *[]*RequestVoteRequest
+	candidatesRPCs *map[*RequestVoteRequest]RPC
 }
 
 type OppositionPolicy uint32
 
 const (
-	LogsCommitedCurrent OppositionPolicy = iota
-	ProcessingCapacity
-	NetworkMeasurement
+	LogsCommitedCurrentOpp OppositionPolicy = iota
+
+	FreeMemoryOpp
+	LogCommitTimeOpp
 )
 
 type oppositionState struct {
-	backoffInitialDuration time.Duration
-	backoffCurrentDuration time.Duration
-	backoffDuration        time.Duration
-	backoffTimeout         time.Time
+	backoffInitDur time.Duration
+	backoffCurrDur time.Duration
+	backoffTimeout time.Time
 
 	lastNegativeVoteTerm uint64
-	oppositionThreshold  uint64
 }
 
 func makeElectionState(rpc RPC, req *RequestVoteRequest) *electionState {
+	electionRelevantTmp := true
+	electionReadyTmp := false
+	candidatesTmp := make([]*RequestVoteRequest, 0)
+	candidatesRPCsTmp := make(map[*RequestVoteRequest]RPC)
 	es := electionState{
 		electionTerm:     req.Term,
-		electionLock:     sync.Mutex{},
-		electionRelevant: true,
-		electionReady:    false,
+		electionLock:     &sync.Mutex{},
+		electionRelevant: &electionRelevantTmp,
+		electionReady:    &electionReadyTmp,
 
-		candidates:     make([]*RequestVoteRequest, 0),
-		candidatesRPCs: make(map[*RequestVoteRequest]RPC),
+		candidates:     &candidatesTmp,
+		candidatesRPCs: &candidatesRPCsTmp,
 	}
-	es.electionActive = *sync.NewCond(&es.electionLock)
+	es.electionActive = sync.NewCond(es.electionLock)
 
-	es.candidates = append(es.candidates, req)
-	es.candidatesRPCs[req] = rpc
+	*es.candidates = append(*es.candidates, req)
+	(*es.candidatesRPCs)[req] = rpc
 	return &es
 }
 
@@ -479,6 +486,9 @@ func (r *Raft) setupLeaderState() {
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
+
+	memInfo, _ := linuxproc.ReadMemInfo("/proc/meminfo")
+	r.logger.Info("MemInfo", "memInfo.MemAvailable", memInfo.MemAvailable)
 
 	// Notify that we are the leader
 	overrideNotifyBool(r.leaderCh, true)
@@ -1280,7 +1290,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	}
 
 	// Write the log entry locally
-	if err := r.logs.StoreLogs(logs); err != nil {
+	if err := r.storeLogsWrapper(logs); err != nil {
 		r.logger.Error("failed to commit logs", "error", err)
 		for _, applyLog := range applyLogs {
 			applyLog.respond(err)
@@ -1297,6 +1307,15 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	for _, f := range r.leaderState.replState {
 		asyncNotifyCh(f.triggerCh)
 	}
+}
+
+func (r *Raft) storeLogsWrapper(logs []*Log) error {
+	startTime := time.Now()
+	if err := r.logs.StoreLogs(logs); err != nil {
+		return err
+	}
+	r.addLogCommitTime(time.Now().Sub(startTime).Nanoseconds())
+	return nil
 }
 
 // processLogs is used to apply all the committed entries that haven't been
@@ -1453,6 +1472,10 @@ func (r *Raft) processHeartbeat(rpc RPC) {
 // only be called from the main thread.
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "appendEntries"}, time.Now())
+
+	//r.logger.Info("appendEntries()", "req.LogsCommitedCurrent", a.LogsCommitedCurrent,
+	//	"req.FreeMemory", a.FreeMemory, "req.LogCommitTime", a.LogCommitTime)
+
 	// Setup a response
 	resp := &AppendEntriesResponse{
 		RPCHeader:      r.getRPCHeader(),
@@ -1551,7 +1574,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 		if n := len(newEntries); n > 0 {
 			// Append the new entries
-			if err := r.logs.StoreLogs(newEntries); err != nil {
+			if err := r.storeLogsWrapper(newEntries); err != nil {
 				r.logger.Error("failed to append to logs", "error", err)
 				// TODO: leaving r.getLastLog() in the wrong
 				// state if there was a truncation above
@@ -1591,29 +1614,46 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 	// TODO do we need to check follower state (is it determined by a check above?)
 	// TODO might not reach this section - if we return from function earlier
-	if a.Term > r.oppositionState.lastNegativeVoteTerm && time.Now().After(r.oppositionState.backoffTimeout) {
-		var leaderPerformance uint64
-		switch r.oppositionPolicy {
-		case ProcessingCapacity:
-			leaderPerformance = 0
-		case NetworkMeasurement:
-			leaderPerformance = 0
+	if a.Term > r.oppositionState.lastNegativeVoteTerm && time.Now().After(r.oppositionState.backoffTimeout) &&
+		(a.LogsCommitedCurrent != 0 || a.FreeMemory != 0 || a.LogCommitTime != 0) {
+		var leaderPerf uint64
+		var oppPolicyStr string
+		oppPolicy := r.config().OppositionPolicy // TODO something like: oppPolicyStr := toString(oppPolicy)
+		oppThreshold := r.config().OppositionThreshold
+		switch oppPolicy {
+		case LogsCommitedCurrentOpp:
+			oppPolicyStr = "LogsCommitedCurrentOpp"
+			leaderPerf = a.LogsCommitedCurrent
+			resp.NegativeVote = a.LogsCommitedCurrent > oppThreshold
+		case FreeMemoryOpp:
+			oppPolicyStr = "FreeMemoryOpp"
+			leaderPerf = a.FreeMemory
+			resp.NegativeVote = a.FreeMemory < oppThreshold
+		case LogCommitTimeOpp:
+			oppPolicyStr = "LogCommitTimeOpp"
+			leaderPerf = a.LogCommitTime
+			resp.NegativeVote = a.LogCommitTime > oppThreshold
+
 		default:
-			leaderPerformance = a.LogsCommitedCurrent
+			oppPolicyStr = "LogsCommitedCurrentOpp"
+			leaderPerf = a.LogsCommitedCurrent
+			resp.NegativeVote = a.LogsCommitedCurrent > oppThreshold
 		}
 
-		if leaderPerformance > r.oppositionState.oppositionThreshold {
+		if resp.NegativeVote {
 			r.logger.Info("[OPPOSITION] Opposition threshold reached, sending negative vote", "term", a.Term,
-				"oppositionPolicy", r.oppositionPolicy, "leaderPerformance", leaderPerformance,
-				"oppositionThreshold", r.oppositionState.oppositionThreshold)
+				"oppositionPolicy", oppPolicyStr, "leaderPerformance", leaderPerf,
+				"oppositionThreshold", oppThreshold)
 			resp.NegativeVote = true
 
-			if time.Now().Before(r.oppositionState.backoffTimeout.Add(r.oppositionState.backoffDuration)) {
-				r.oppositionState.backoffDuration *= 2
-			} else if r.oppositionState.backoffDuration > r.oppositionState.backoffInitialDuration {
-				r.oppositionState.backoffDuration /= 2
+			if time.Now().Before(r.oppositionState.backoffTimeout.Add(r.oppositionState.backoffCurrDur)) {
+				r.oppositionState.backoffCurrDur *= 2
+			} else if r.oppositionState.backoffCurrDur > r.oppositionState.backoffInitDur {
+				r.oppositionState.backoffCurrDur /= 2
 			}
-			r.oppositionState.backoffTimeout = time.Now().Add(r.oppositionState.backoffDuration)
+			r.logger.Info("[OPPOSITION] Pause sending negative votes", "backoffCurrDur",
+				r.oppositionState.backoffCurrDur, "backoffTimeout", r.oppositionState.backoffTimeout)
+			r.oppositionState.backoffTimeout = time.Now().Add(r.oppositionState.backoffCurrDur)
 			r.oppositionState.lastNegativeVoteTerm = a.Term
 		}
 	}
@@ -1652,7 +1692,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	denyVote := true
 	defer func() {
 		if denyVote {
-			r.sendDeniedVote(rpc)
+			r.sendDeniedVote(rpc, req)
 		}
 	}()
 
@@ -1759,13 +1799,20 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 	denyVote = false
 	if r.electionState == nil || req.Term > r.electionState.electionTerm {
+
+		if r.electionState == nil {
+			r.logger.Info("[ELECTION] Old election not found, r.electionState == nil")
+		} else {
+			r.logger.Info("[ELECTION] Old election found", "newTerm", req.Term, "oldTerm", r.electionState.electionTerm)
+		}
+
 		r.logger.Info("[ELECTION] starting new election", "term", req.Term)
 		if r.electionState != nil {
 			r.electionState.electionActive.L.Lock()
 
 			r.logger.Info("[ELECTION] sending signal to stop old election", "term", r.electionState.electionTerm)
-			r.electionState.electionRelevant = false
-			r.electionState.electionReady = true
+			*r.electionState.electionRelevant = false
+			*r.electionState.electionReady = true
 			r.electionState.electionActive.Signal()
 
 			r.electionState.electionActive.L.Unlock()
@@ -1773,18 +1820,18 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 		r.logger.Info("[ELECTION] adding vote to current election", "term", req.Term, "voteCount", 1)
 		r.electionState = makeElectionState(rpc, req)
-		go r.runElectionAfterDelay()
+		go r.runElectionAfterDelay(*r.electionState)
 	} else {
 		r.electionState.electionActive.L.Lock()
 
-		r.electionState.candidates = append(r.electionState.candidates, req)
-		r.electionState.candidatesRPCs[req] = rpc
+		*r.electionState.candidates = append(*r.electionState.candidates, req)
+		(*r.electionState.candidatesRPCs)[req] = rpc
 		r.logger.Info("[ELECTION] adding vote to current election", "term", req.Term,
-			"voteCount", len(r.electionState.candidates), "clusterSize", r.clusterSize(), "maxSize", float32(r.clusterSize())/3)
+			"voteCount", len(*r.electionState.candidates), "clusterSize", r.clusterSize(), "maxSize", float32(r.clusterSize())/3)
 
-		if float32(len(r.electionState.candidates)) > float32(r.clusterSize())/3 { // TODO can be immediately true on newElection
+		if float32(len(*r.electionState.candidates)) > float32(r.clusterSize())/3 { // TODO can be immediately true on newElection
 			r.logger.Info("[ELECTION] sending signal to finish election - size", "term", r.electionState.electionTerm)
-			r.electionState.electionReady = true
+			*r.electionState.electionReady = true
 			r.electionState.electionActive.Signal()
 		}
 
@@ -1792,71 +1839,91 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 }
 
-func (r *Raft) runElectionAfterDelay() {
-	go r.runElection(r.electionState)
+func (r *Raft) runElectionAfterDelay(election electionState) {
+	go r.runElection(election)
 	time.Sleep(r.config().ElectionTimeout / 3)
 
-	r.electionState.electionActive.L.Lock()
-	r.logger.Info("[ELECTION] sending signal to finish election - timeout", "term", r.electionState.electionTerm)
-	r.electionState.electionReady = true
-	r.electionState.electionActive.Signal()
-	r.electionState.electionActive.L.Unlock()
+	election.electionActive.L.Lock()
+	r.logger.Info("[ELECTION] sending signal to finish election - timeout", "term", election.electionTerm)
+	*election.electionReady = true
+	election.electionActive.Signal()
+	election.electionActive.L.Unlock()
 }
 
 // TODO derive less(left, right int) from electionPolicy
 // TODO do I need to construct resp for every candidate?
 // TODO use term from electionState
 // TODO might use goFunc to start two goroutines
-func (r *Raft) runElection(election *electionState) {
+func (r *Raft) runElection(election electionState) {
 	election.electionActive.L.Lock()
 	defer election.electionActive.L.Unlock()
 
-	for election.electionRelevant && !election.electionReady {
+	for *election.electionRelevant && !*election.electionReady {
 		election.electionActive.Wait()
+		r.logger.Info("[ELECTION] runElection() woke up", "term", election.electionTerm)
 	}
+	r.logger.Info("[ELECTION] runElection() activated", "term", election.electionTerm)
 
-	if !election.electionRelevant {
+	if !*election.electionRelevant {
 		r.logger.Info("[ELECTION] election is no longer relevant", "term", election.electionTerm)
-		for _, rpc := range election.candidatesRPCs {
-			r.sendDeniedVote(rpc)
+		for index := 0; index < len(*election.candidates); index++ {
+			r.sendDeniedVote((*election.candidatesRPCs)[(*election.candidates)[index]], (*election.candidates)[index])
 		}
 		return
 	}
 
-	r.logger.Info("[ELECTION] sorting votes", "voteCount", len(election.candidates))
-	sort.Slice(election.candidates, func(left, right int) bool {
-		switch r.electionPolicy {
-		case ElectionsWon:
-			return election.candidates[left].ElectionsWon > election.candidates[right].ElectionsWon
+	r.logger.Info("[ELECTION] sorting votes", "voteCount", len(*election.candidates))
+	sort.Slice(*election.candidates, func(left, right int) bool {
+		switch r.config().ElectionPolicy {
+		case ElectionsWonElc:
+			return (*election.candidates)[left].ElectionsWon > (*election.candidates)[right].ElectionsWon
+		case LogsCommitedTotalElc:
+			return (*election.candidates)[left].LogsCommitedTotal > (*election.candidates)[right].LogsCommitedTotal
+		case FreeMemoryElc:
+			return (*election.candidates)[left].FreeMemory > (*election.candidates)[right].FreeMemory
+		case LogCommitTimeElc:
+			return (*election.candidates)[left].LogCommitTime < (*election.candidates)[right].LogCommitTime
+
 		default:
-			return election.candidates[left].LogsCommitedTotal > election.candidates[right].LogsCommitedTotal
+			return (*election.candidates)[left].ElectionsWon > (*election.candidates)[right].ElectionsWon
 		}
 	})
 
 	var electionPolicyStr string
 	var winnerValue uint64
-	switch r.electionPolicy {
-	case ElectionsWon:
+	switch r.config().ElectionPolicy {
+	case ElectionsWonElc:
 		electionPolicyStr = "ElectionsWon"
-		winnerValue = election.candidates[0].ElectionsWon
-	default:
+		winnerValue = (*election.candidates)[0].ElectionsWon
+	case LogsCommitedTotalElc:
 		electionPolicyStr = "LogsCommitedTotal"
-		winnerValue = election.candidates[0].LogsCommitedTotal
+		winnerValue = (*election.candidates)[0].LogsCommitedTotal
+	case FreeMemoryElc:
+		electionPolicyStr = "FreeMemoryElc"
+		winnerValue = (*election.candidates)[0].FreeMemory
+	case LogCommitTimeElc:
+		electionPolicyStr = "LogCommitTimeElc"
+		winnerValue = (*election.candidates)[0].LogCommitTime
+
+	default:
+		electionPolicyStr = "ElectionsWon"
+		winnerValue = (*election.candidates)[0].ElectionsWon
 	}
 
 	r.logger.Info("[ELECTION] best candidate determined", "term", election.electionTerm, "electionPolicy", electionPolicyStr, "winnerValue", winnerValue)
 
-	for candidateIndex := 1; candidateIndex < len(election.candidates); candidateIndex++ {
-		r.sendDeniedVote(election.candidatesRPCs[election.candidates[candidateIndex]])
+	for index := 1; index < len(*election.candidates); index++ {
+		r.sendDeniedVote((*election.candidatesRPCs)[(*election.candidates)[index]], (*election.candidates)[index])
 	}
-	r.sendGrantedVote(election.candidatesRPCs[election.candidates[0]], election.candidates[0])
+	r.sendGrantedVote((*election.candidatesRPCs)[(*election.candidates)[0]], (*election.candidates)[0])
+
 	// TODO clear electionState
 }
 
-func (r *Raft) sendDeniedVote(rpc RPC) {
+func (r *Raft) sendDeniedVote(rpc RPC, req *RequestVoteRequest) {
 	resp := &RequestVoteResponse{
 		RPCHeader: r.getRPCHeader(),
-		Term:      r.getCurrentTerm(),
+		Term:      req.Term,
 		Granted:   false,
 	}
 
@@ -1874,7 +1941,7 @@ func (r *Raft) sendDeniedVote(rpc RPC) {
 func (r *Raft) sendGrantedVote(rpc RPC, req *RequestVoteRequest) {
 	resp := &RequestVoteResponse{
 		RPCHeader: r.getRPCHeader(),
-		Term:      r.getCurrentTerm(),
+		Term:      req.Term,
 		Granted:   true,
 	}
 
@@ -2074,6 +2141,11 @@ func (r *Raft) electSelf() <-chan *voteResult {
 	r.setCurrentTerm(r.getCurrentTerm() + 1)
 
 	// Construct the request
+	memInfo, err := linuxproc.ReadMemInfo("/proc/meminfo")
+	if err != nil {
+		r.logger.Error("failed to collect memory info for requestVote RPC", "error", err)
+	}
+
 	lastIdx, lastTerm := r.getLastEntry()
 	req := &RequestVoteRequest{
 		RPCHeader: r.getRPCHeader(),
@@ -2084,6 +2156,8 @@ func (r *Raft) electSelf() <-chan *voteResult {
 		LastLogTerm:        lastTerm,
 		ElectionsWon:       r.getElectionsWon(),
 		LogsCommitedTotal:  r.getLogsCommitedTotal(),
+		FreeMemory:         memInfo.MemAvailable,
+		LogCommitTime:      uint64(r.getLogCommitTime()),
 		LeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),
 	}
 

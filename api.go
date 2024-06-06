@@ -113,11 +113,8 @@ type Raft struct {
 	// fsmSnapshotCh is used to trigger a new snapshot being taken
 	fsmSnapshotCh chan *reqSnapshotFuture
 
-	electionPolicy ElectionPolicy
-	electionState  *electionState
-
-	oppositionPolicy OppositionPolicy
-	oppositionState  *oppositionState
+	electionState   *electionState
+	oppositionState *oppositionState
 
 	// lastContact is the last time we had contact from the
 	// leader node. This can be used to gauge staleness.
@@ -522,18 +519,15 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 
 	// Make sure we have a valid server address and ID.
 	protocolVersion := conf.ProtocolVersion
-	electionPolicy := conf.ElectionPolicy
-	oppositionPolicy := conf.OppositionPolicy
-	backoffInitialDuration := time.Duration(conf.OppositionBackoffDurationSeconds * uint64(time.Second))
+	backoffInitDuration := time.Duration(conf.BackoffDurSecs * uint64(time.Second))
 	oppositionInitialState := &oppositionState{
-		backoffInitialDuration: backoffInitialDuration,
-		backoffCurrentDuration: backoffInitialDuration,
-		backoffTimeout:         time.Now(),
-		backoffIncreaseTimeout: time.Now(),
+		backoffInitDur: backoffInitDuration,
+		backoffCurrDur: backoffInitDuration,
+		backoffTimeout: time.Now(),
 
 		lastNegativeVoteTerm: 0,
-		oppositionThreshold:  conf.OppositionThreshold,
 	}
+
 	localAddr := trans.LocalAddr()
 	localID := conf.LocalID
 
@@ -556,8 +550,6 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		fsm:                   fsm,
 		fsmMutateCh:           make(chan interface{}, 128),
 		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
-		electionPolicy:        electionPolicy,
-		oppositionPolicy:      oppositionPolicy,
 		oppositionState:       oppositionInitialState,
 		leaderCh:              make(chan bool, 1),
 		localID:               localID,
@@ -582,6 +574,14 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		followerNotifyCh:      make(chan struct{}, 1),
 		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
 	}
+
+	r.logger.Info("NewRaft configuration",
+		"HeartbeatTimeout", conf.HeartbeatTimeout,
+		"ElectionTimeout", conf.ElectionTimeout,
+		"ElectionPolicy", conf.ElectionPolicy,
+		"OppositionPolicy", conf.OppositionPolicy,
+		"OppositionThreshold", conf.OppositionThreshold,
+		"BackoffDurSecs", conf.BackoffDurSecs)
 
 	r.conf.Store(*conf)
 

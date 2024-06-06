@@ -73,7 +73,8 @@ type raftState struct {
 	logsCommitedTotal   uint64
 	logsCommitedCurrent uint64
 
-	logsCommitTimeBuffer []uint64
+	logCommitTimeBuffer []int64
+	avgLogCommitTime    int64
 
 	// Tracks running goroutines
 	routinesGroup sync.WaitGroup
@@ -139,19 +140,22 @@ func (r *raftState) setLogsCommitedCurrent(logsCommited uint64) {
 	atomic.StoreUint64(&r.logsCommitedCurrent, logsCommited)
 }
 
-func (r *raftState) addLogCommitTime(logCommitTime uint64) {
-	r.logsCommitTimeBuffer = append(r.logsCommitTimeBuffer, logCommitTime)
-	if len(r.logsCommitTimeBuffer) == 10 {
-		r.logsCommitTimeBuffer = r.logsCommitTimeBuffer[1:]
+func (r *raftState) addLogCommitTime(logCommitTime int64) {
+	r.logCommitTimeBuffer = append(r.logCommitTimeBuffer, logCommitTime)
+	if len(r.logCommitTimeBuffer) == 10 {
+		r.logCommitTimeBuffer = r.logCommitTimeBuffer[1:]
 	}
+
+	var sum int64
+	for i := 0; i < len(r.logCommitTimeBuffer); i++ {
+		sum += r.logCommitTimeBuffer[i]
+	}
+
+	atomic.StoreInt64(&r.avgLogCommitTime, sum/int64(len(r.logCommitTimeBuffer)))
 }
 
-func (r *raftState) getAvgLogCommitTime() uint64 {
-	var sum uint64
-	for i := 0; i < len(r.logsCommitTimeBuffer); i++ {
-		sum += r.logsCommitTimeBuffer[i]
-	}
-	return sum / uint64(len(r.logsCommitTimeBuffer))
+func (r *raftState) getLogCommitTime() int64 {
+	return atomic.LoadInt64(&r.avgLogCommitTime)
 }
 
 func (r *raftState) getLastSnapshot() (index, term uint64) {

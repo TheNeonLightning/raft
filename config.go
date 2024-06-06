@@ -150,14 +150,14 @@ type Config struct {
 	// from a leader before we attempt an election.
 	HeartbeatTimeout time.Duration
 
-	ElectionPolicy                   ElectionPolicy
-	OppositionPolicy                 OppositionPolicy
-	OppositionThreshold              uint64
-	OppositionBackoffDurationSeconds uint64
-
 	// ElectionTimeout specifies the time in candidate state without contact
 	// from a leader before we attempt an election.
 	ElectionTimeout time.Duration
+
+	ElectionPolicy      ElectionPolicy
+	OppositionPolicy    OppositionPolicy
+	OppositionThreshold uint64
+	BackoffDurSecs      uint64
 
 	// CommitTimeout specifies the time without an Apply operation before the
 	// leader sends an AppendEntry RPC to followers, to ensure a timely commit of
@@ -286,6 +286,11 @@ type ReloadableConfig struct {
 	// ElectionTimeout specifies the time in candidate state without
 	// a leader before we attempt an election.
 	ElectionTimeout time.Duration
+
+	ElectionPolicy      ElectionPolicy
+	OppositionPolicy    OppositionPolicy
+	OppositionThreshold uint64
+	BackoffDurSecs      uint64
 }
 
 // apply sets the reloadable fields on the passed Config to the values in
@@ -297,6 +302,10 @@ func (rc *ReloadableConfig) apply(to Config) Config {
 	to.SnapshotThreshold = rc.SnapshotThreshold
 	to.HeartbeatTimeout = rc.HeartbeatTimeout
 	to.ElectionTimeout = rc.ElectionTimeout
+	to.ElectionPolicy = rc.ElectionPolicy
+	to.OppositionPolicy = rc.OppositionPolicy
+	to.OppositionThreshold = rc.OppositionThreshold
+	to.BackoffDurSecs = rc.BackoffDurSecs
 	return to
 }
 
@@ -307,22 +316,30 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 	rc.SnapshotThreshold = from.SnapshotThreshold
 	rc.HeartbeatTimeout = from.HeartbeatTimeout
 	rc.ElectionTimeout = from.ElectionTimeout
+	rc.ElectionPolicy = from.ElectionPolicy
+	rc.OppositionPolicy = from.OppositionPolicy
+	rc.OppositionThreshold = from.OppositionThreshold
+	rc.BackoffDurSecs = from.BackoffDurSecs
 }
 
 // DefaultConfig returns a Config with usable defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		ProtocolVersion:    ProtocolVersionMax,
-		HeartbeatTimeout:   1000 * time.Millisecond,
-		ElectionTimeout:    1000 * time.Millisecond,
-		CommitTimeout:      50 * time.Millisecond,
-		MaxAppendEntries:   64,
-		ShutdownOnRemove:   true,
-		TrailingLogs:       10240,
-		SnapshotInterval:   120 * time.Second,
-		SnapshotThreshold:  8192,
-		LeaderLeaseTimeout: 500 * time.Millisecond,
-		LogLevel:           "DEBUG",
+		ProtocolVersion:     ProtocolVersionMax,
+		HeartbeatTimeout:    500 * time.Millisecond,
+		ElectionTimeout:     500 * time.Millisecond,
+		ElectionPolicy:      LogCommitTimeElc,
+		OppositionPolicy:    LogCommitTimeOpp,
+		OppositionThreshold: 200000000,
+		BackoffDurSecs:      60,
+		CommitTimeout:       50 * time.Millisecond,
+		MaxAppendEntries:    64,
+		ShutdownOnRemove:    true,
+		TrailingLogs:        10240,
+		SnapshotInterval:    120 * time.Second,
+		SnapshotThreshold:   8192,
+		LeaderLeaseTimeout:  500 * time.Millisecond,
+		LogLevel:            "DEBUG",
 	}
 }
 

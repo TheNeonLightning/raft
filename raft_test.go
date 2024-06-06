@@ -1436,6 +1436,7 @@ func snapshotAndRestore(t *testing.T, offset uint64, monotonicLogStore bool, res
 
 	// Make the cluster.
 	conf := inmemConfig(t)
+	conf.OppositionThreshold = 10000000
 
 	// snapshot operations perform some file IO operations.
 	// increase times out to account for that
@@ -2063,8 +2064,9 @@ func TestRaft_AppendEntry(t *testing.T) {
 
 func TestRaft_FollowerOpposeLeader(t *testing.T) {
 	conf := inmemConfig(t)
-	conf.OppositionPolicy = LogsCommitedCurrent
+	conf.OppositionPolicy = LogsCommitedCurrentOpp
 	conf.OppositionThreshold = 100
+	conf.BackoffDurSecs = 0
 	c := MakeCluster(3, t, conf)
 	defer c.Close()
 
@@ -2127,7 +2129,7 @@ func TestRaft_FollowerOpposeLeader(t *testing.T) {
 
 func TestRaft_LeaderStepDownOnOppositionMajority(t *testing.T) {
 	conf := inmemConfig(t)
-	conf.OppositionPolicy = LogsCommitedCurrent
+	conf.OppositionPolicy = LogsCommitedCurrentOpp
 	conf.OppositionThreshold = 100
 	c := MakeCluster(3, t, conf)
 	defer c.Close()
@@ -2154,6 +2156,102 @@ func TestRaft_LeaderStepDownOnOppositionMajority(t *testing.T) {
 	if currTerm <= prevTerm {
 		t.Fatalf("expected leader to step down due to opposition: currTerm - %v, prevterm - %v", currTerm, prevTerm)
 	}
+}
+
+func TestRaft_FollowerOppositionBackoff(t *testing.T) {
+	conf := inmemConfig(t)
+	conf.OppositionPolicy = LogsCommitedCurrentOpp
+	conf.OppositionThreshold = 100
+	conf.BackoffDurSecs = 3
+	c := MakeCluster(3, t, conf)
+	defer c.Close()
+
+	followers := c.Followers()
+	ldr := c.Leader()
+	ldrT := c.trans[c.IndexOf(ldr)]
+
+	reqAppendEntries := AppendEntriesRequest{
+		RPCHeader:    ldr.getRPCHeader(),
+		Term:         ldr.getCurrentTerm(),
+		PrevLogEntry: 0,
+		PrevLogTerm:  ldr.getCurrentTerm(),
+		Leader:       nil,
+		Entries: []*Log{
+			{
+				Index: 0,
+				Term:  ldr.getCurrentTerm() + 1,
+				Type:  LogCommand,
+				Data:  []byte("log 1"),
+			},
+		},
+		LeaderCommitIndex:   90,
+		LogsCommitedCurrent: conf.OppositionThreshold + 1,
+	}
+	var resp0 AppendEntriesResponse
+	var resp1 AppendEntriesResponse
+
+	index0 := followers[0].getLastIndex()
+	index1 := followers[1].getLastIndex()
+
+	// Threshold reached - follower should send negative vote
+	reqAppendEntries.Entries[0].Index = index0 + 1
+	if err := ldrT.AppendEntries(followers[0].localID, followers[0].localAddr, &reqAppendEntries, &resp0); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	reqAppendEntries.Entries[0].Index = index1 + 1
+	if err := ldrT.AppendEntries(followers[1].localID, followers[1].localAddr, &reqAppendEntries, &resp1); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	require.True(t, resp0.Success && resp1.Success)
+	require.True(t, resp0.NegativeVote && resp1.NegativeVote)
+
+	// Threshold reached and new term marked but follower should be on opposition backoff
+	reqAppendEntries.Term += 1
+	reqAppendEntries.Entries[0].Index = index0 + 1
+	if err := ldrT.AppendEntries(followers[0].localID, followers[0].localAddr, &reqAppendEntries, &resp0); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	reqAppendEntries.Entries[0].Index = index1 + 1
+	if err := ldrT.AppendEntries(followers[1].localID, followers[1].localAddr, &reqAppendEntries, &resp1); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	require.True(t, resp0.Success && resp1.Success)
+	require.False(t, resp0.NegativeVote && resp1.NegativeVote)
+
+	time.Sleep(6 * time.Second)
+
+	followers = c.Followers()
+	ldr = c.Leader()
+	ldrT = c.trans[c.IndexOf(ldr)]
+
+	reqAppendEntries = AppendEntriesRequest{
+		RPCHeader:    ldr.getRPCHeader(),
+		Term:         ldr.getCurrentTerm(),
+		PrevLogEntry: 0,
+		PrevLogTerm:  ldr.getCurrentTerm(),
+		Leader:       nil,
+		Entries: []*Log{
+			{
+				Index: 0,
+				Term:  ldr.getCurrentTerm() + 1,
+				Type:  LogCommand,
+				Data:  []byte("log 1"),
+			},
+		},
+		LeaderCommitIndex:   90,
+		LogsCommitedCurrent: conf.OppositionThreshold + 1,
+	}
+
+	reqAppendEntries.Entries[0].Index = followers[0].getLastApplied() + 1
+	if err := ldrT.AppendEntries(followers[0].localID, followers[0].localAddr, &reqAppendEntries, &resp0); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	reqAppendEntries.Entries[0].Index = followers[1].getLastApplied() + 1
+	if err := ldrT.AppendEntries(followers[1].localID, followers[1].localAddr, &reqAppendEntries, &resp1); err != nil {
+		t.Fatalf("RequestVote RPC failed %v", err)
+	}
+	require.True(t, resp0.Success && resp1.Success)
+	require.True(t, resp0.NegativeVote && resp1.NegativeVote)
 }
 
 func TestRaft_VotingGrant_WhenLeaderAvailable(t *testing.T) {
@@ -2813,6 +2911,7 @@ func TestRaft_ReloadConfig(t *testing.T) {
 		SnapshotThreshold: 6789,
 		HeartbeatTimeout:  45 * time.Millisecond,
 		ElectionTimeout:   46 * time.Millisecond,
+		ElectionPolicy:    2,
 	}
 
 	require.NoError(t, raft.ReloadConfig(newCfg))
@@ -2823,6 +2922,9 @@ func TestRaft_ReloadConfig(t *testing.T) {
 	require.Equal(t, newCfg.SnapshotThreshold, raft.config().SnapshotThreshold)
 	require.Equal(t, newCfg.HeartbeatTimeout, raft.config().HeartbeatTimeout)
 	require.Equal(t, newCfg.ElectionTimeout, raft.config().ElectionTimeout)
+	require.Equal(t, newCfg.ElectionPolicy, raft.config().ElectionPolicy)
+	require.Equal(t, FreeMemoryElc, raft.config().ElectionPolicy)
+
 }
 
 func TestRaft_ReloadConfigValidates(t *testing.T) {
@@ -2974,10 +3076,10 @@ func TestRaft_VoteNotGranted_WhenNodeNotInCluster(t *testing.T) {
 	}
 }
 
-func TestRaft_VoteForBestCandidateLogsCommitedTotal(t *testing.T) {
+func voteForBestCandidateElectionPolicyTest(t *testing.T, ep ElectionPolicy) {
 	// Make a cluster
 	conf := inmemConfig(t)
-	conf.ElectionPolicy = LogsCommitedTotal
+	conf.ElectionPolicy = ep
 	c := MakeCluster(5, t, conf)
 	defer c.Close()
 
@@ -3010,9 +3112,18 @@ func TestRaft_VoteForBestCandidateLogsCommitedTotal(t *testing.T) {
 	reqVote[0].ElectionsWon = 4
 	reqVote[1].ElectionsWon = 6
 	reqVote[2].ElectionsWon = 8
+
 	reqVote[0].LogsCommitedTotal = 20
 	reqVote[1].LogsCommitedTotal = 21
 	reqVote[2].LogsCommitedTotal = 22
+
+	reqVote[0].FreeMemory = 2000
+	reqVote[1].FreeMemory = 4000
+	reqVote[2].FreeMemory = 8000
+
+	reqVote[0].LogCommitTime = 500
+	reqVote[1].LogCommitTime = 450
+	reqVote[2].LogCommitTime = 300
 
 	var resp [3]RequestVoteResponse
 
@@ -3063,93 +3174,20 @@ func TestRaft_VoteForBestCandidateLogsCommitedTotal(t *testing.T) {
 	}
 }
 
-func TestRaft_VoteForBestCandidateElectionsWon(t *testing.T) {
-	// Make a cluster
-	conf := inmemConfig(t)
-	conf.ElectionPolicy = ElectionsWon
-	c := MakeCluster(5, t, conf)
-	defer c.Close()
+func TestRaft_VoteForBestCandidateElectionsWonElc(t *testing.T) {
+	voteForBestCandidateElectionPolicyTest(t, ElectionsWonElc)
+}
 
-	// Get the leader
-	leader := c.Leader()
+func TestRaft_VoteForBestCandidateLogsCommitedTotalElc(t *testing.T) {
+	voteForBestCandidateElectionPolicyTest(t, LogsCommitedTotalElc)
+}
 
-	// Wait until we have 4 followers
-	limit := time.Now().Add(c.longstopTimeout)
-	var followers []*Raft
-	for time.Now().Before(limit) && len(followers) != 4 {
-		c.WaitEvent(nil, c.conf.CommitTimeout)
-		followers = c.GetInState(Follower)
-	}
-	if len(followers) != 4 {
-		t.Fatalf("expected four followers: %v", followers)
-	}
+func TestRaft_VoteForBestCandidateMemoryTotalElc(t *testing.T) {
+	voteForBestCandidateElectionPolicyTest(t, FreeMemoryElc)
+}
 
-	votingFollower := followers[3]
-	var reqVote [3]RequestVoteRequest
-	electionTerm := votingFollower.getCurrentTerm() + 10
-	for index := 0; index < 3; index++ {
-		reqVote[index] = RequestVoteRequest{
-			RPCHeader:          followers[index].getRPCHeader(),
-			Term:               electionTerm,
-			LastLogIndex:       followers[index].LastIndex(),
-			LastLogTerm:        followers[index].getCurrentTerm(),
-			LeadershipTransfer: false,
-		}
-	}
-	reqVote[0].ElectionsWon = 4
-	reqVote[1].ElectionsWon = 6
-	reqVote[2].ElectionsWon = 8
-	reqVote[0].LogsCommitedTotal = 20
-	reqVote[1].LogsCommitedTotal = 21
-	reqVote[2].LogsCommitedTotal = 22
-
-	var resp [3]RequestVoteResponse
-
-	c.logger.Info("[TEST] voting follower disconnected from leader")
-	c.trans[c.IndexOf(votingFollower)].Disconnect(leader.localAddr)
-	c.trans[c.IndexOf(leader)].Disconnect(votingFollower.localAddr)
-	time.Sleep(c.propagateTimeout)
-	c.logger.Info("[TEST]", "disconnected leader", leader.localAddr, "voter", votingFollower.localAddr)
-
-	// wait for the remaining follower to trigger an election
-	waitForState(votingFollower, Candidate)
-	require.Equal(t, Candidate, votingFollower.getState())
-
-	var routinesGroup sync.WaitGroup
-	askPeer := func(followerTrans LoopbackTransport, req RequestVoteRequest, resp *RequestVoteResponse) {
-		if err := followerTrans.RequestVote(votingFollower.localID, votingFollower.localAddr, &req, resp); err != nil {
-			t.Fatalf("RequestVote RPC failed %v", err)
-		}
-		routinesGroup.Done()
-	}
-
-	c.logger.Info("[TEST] sending requests", "term", electionTerm)
-
-	routinesGroup.Add(1)
-	followerTrans := c.trans[c.IndexOf(followers[0])]
-	go askPeer(followerTrans, reqVote[0], &resp[0])
-
-	routinesGroup.Add(1)
-	followerTrans = c.trans[c.IndexOf(followers[1])]
-	go askPeer(followerTrans, reqVote[1], &resp[1])
-
-	time.Sleep(conf.ElectionTimeout / 8)
-
-	routinesGroup.Add(1)
-	followerTrans = c.trans[c.IndexOf(followers[2])]
-	go askPeer(followerTrans, reqVote[2], &resp[2])
-
-	routinesGroup.Wait()
-
-	if resp[0].Granted {
-		t.Fatalf("Follower 0: expected vote to not be granted, but it was %+v", resp)
-	}
-	if !resp[1].Granted {
-		t.Fatalf("Follower 1: expected vote to be granted, but it was not %+v", resp)
-	}
-	if resp[2].Granted {
-		t.Fatalf("Follower 2: expected vote to not be granted, but it was %+v", resp)
-	}
+func TestRaft_VoteForBestCandidateLogCommitTimeElc(t *testing.T) {
+	voteForBestCandidateElectionPolicyTest(t, LogCommitTimeElc)
 }
 
 func TestRaft_ClusterCanRegainStability_WhenNonVoterWithHigherTermJoin(t *testing.T) {

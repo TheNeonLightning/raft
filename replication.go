@@ -6,12 +6,13 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"github.com/pbnjay/memory"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/armon/go-metrics"
-	"github.com/pbnjay/memory"
+	linuxproc "github.com/c9s/goprocinfo/linux"
 )
 
 const (
@@ -570,6 +571,8 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 	}
 }
 
+var logCounter = 1
+
 // setupAppendEntries is used to setup an append entries request.
 func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {
 	req.RPCHeader = r.getRPCHeader()
@@ -577,9 +580,24 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequ
 	// this is needed for retro compatibility, before RPCHeader.Addr was added
 	req.Leader = r.trans.EncodePeer(r.localID, r.localAddr)
 	req.LeaderCommitIndex = r.getCommitIndex()
+
 	req.LogsCommitedCurrent = r.getLogsCommitedCurrent()
-	req.TotalMemory = memory.TotalMemory()
-	req.AvgLogCommitTime = r.getAvgLogCommitTime()
+
+	memInfo, err := linuxproc.ReadMemInfo("/proc/meminfo")
+	if err != nil {
+		return err
+	}
+
+	req.FreeMemory = memInfo.MemAvailable
+	req.LogCommitTime = uint64(r.getLogCommitTime())
+
+	logCounter += 1
+	if logCounter%500 == 0 {
+		r.logger.Info("setupAppendEntries()", "req.LogsCommitedCurrent", req.LogsCommitedCurrent,
+			"req.FreeMemory", req.FreeMemory, "req.LogCommitTime", req.LogCommitTime,
+			"memory.FreeMemory", memory.FreeMemory(), "memInfo.MemFree", memInfo.MemFree)
+	}
+
 	if err := r.setPreviousLog(req, nextIndex); err != nil {
 		return err
 	}
@@ -654,7 +672,7 @@ func (r *Raft) handleStaleTerm(s *followerReplication) {
 }
 
 func (r *Raft) handleNegativeVote(s *followerReplication) (shouldStop bool) {
-	oppositionSize := atomic.LoadInt32(&r.leaderState.oppositionSize) + 1
+	oppositionSize := atomic.AddInt32(&r.leaderState.oppositionSize, 1)
 	r.logger.Info("[OPPOSITION] Leader received negative vote", "opposition size", oppositionSize)
 	if int(oppositionSize) >= r.quorumSize() {
 		r.logger.Info("[OPPOSITION] Opposition reached quorum, leader stepping down")
@@ -662,7 +680,6 @@ func (r *Raft) handleNegativeVote(s *followerReplication) (shouldStop bool) {
 		asyncNotifyCh(s.stepDown)
 		return true
 	}
-	atomic.StoreInt32(&r.leaderState.oppositionSize, oppositionSize)
 	return false
 }
 

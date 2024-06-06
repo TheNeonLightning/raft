@@ -1,0 +1,117 @@
+CGO_ENABLED=0 /home/tnl/sdk/go1.22.1/bin/go build -o /home/tnl/consul/bin/consul github.com/hashicorp/consul #gosetup
+
+export IMAGE_URL=hashicorp/consul:latest
+docker pull $IMAGE_URL
+docker create --name temp_container $IMAGE_URL
+docker cp /home/tnl/consul/bin/consul temp_container:/bin/consul
+docker commit temp_container theneonlightning7/consul:v22
+docker push theneonlightning7/consul:v22
+
+change image version
+
+kubectl delete namespace consul
+
+cd ../learn-consul-get-started-kubernetes/self-managed/local/
+
+helm install --values helm/values-v1.yaml consul /home/tnl/Downloads/consul-1.4.1.tgz --create-namespace --namespace consul --version "1.4.1"
+helm install --values helm/consul-v2-telemetry.yaml consul /home/tnl/Downloads/consul-1.4.1.tgz --create-namespace --namespace consul --version "1.4.1"
+
+************************************************************************************************************************
+************************************************************************************************************************
+************************************************************************************************************************
+
+kubectl exec --stdin --tty consul-server-1 -n consul -- /bin/sh
+
+echo '{"HeartbeatTimeout": 2500000000,"ElectionTimeout": 2500000000,"ElectionPolicy": 2,"OppositionPolicy": 1,"OppositionThreshold": 7000000,"BackoffDurSecs": 60}' > /home/consul/raft.json && cd /bin && consul reload
+
+OppositionPolicy: FreeMemoryOpp
+3_099_028
+3_144_040
+2_948_912
+3_096_008
+
+ElectionPolicy: FreeMemoryElc
+1_392_750_592
+1_286_402_048
+  118_083_584
+  465_317_888
+
+OppositionPolicy: LogCommitTimeOpp 10000000
+4_765_952
+29_219_554
+5_556_958
+
+************************************************************************************************************************
+************************************************************************************************************************
+************************************************************************************************************************
+
+kubectl port-forward svc/consul-ui --namespace consul 8501:443
+kubectl port-forward svc/nginx --namespace default 8080:80
+kubectl port-forward svc/grafana --namespace default 3000:3000
+
+kubectl port-forward svc/consul-server --namespace consul 8500:8500
+
+************************************************************************************************************************
+************************************************************************************************************************
+************************************************************************************************************************
+
+kubectl delete namespace litmus
+kubectl create ns litmus
+helm install chaos litmuschaos/litmus --namespace=litmus --set portal.frontend.service.type=NodePort --version=3.6.0
+kubectl get pods -n litmus
+kubectl get svc -n litmus
+
+
+
+
+
+
+
+
+
+
+req.FreeMemory=7223548 req.LogCommitTime=14486700 memory.FreeMemory=1575317504 memInfo.MemFree=1538396
+req.FreeMemory=7222816 req.LogCommitTime=3810724 memory.FreeMemory=1574486016  memInfo.MemFree=1537584
+req.FreeMemory=7218060 req.LogCommitTime=4298176 memory.FreeMemory=1569533952  memInfo.MemFree=1532748
+req.FreeMemory=7218060 req.LogCommitTime=4298176 memory.FreeMemory=1569533952  memInfo.MemFree=1532748
+req.FreeMemory=7101464 req.LogCommitTime=4686100 memory.FreeMemory=1447657472  memInfo.MemFree=1413728
+req.FreeMemory=6990996 req.LogCommitTime=14804936 memory.FreeMemory=1334407168 memInfo.MemFree=1303132
+req.FreeMemory=7148756 req.LogCommitTime=14525138 memory.FreeMemory=1494421504 memInfo.MemFree=1459396
+req.FreeMemory=7085552 req.LogCommitTime=25158080 memory.FreeMemory=1429610496 memInfo.MemFree=1396104
+req.FreeMemory=7096688 req.LogCommitTime=35901246 memory.FreeMemory=1440927744 memInfo.MemFree=1407156
+req.FreeMemory=7218680 req.LogCommitTime=25495726 memory.FreeMemory=1566195712 memInfo.MemFree=1529488
+req.FreeMemory=7220400 req.LogCommitTime=25338655 memory.FreeMemory=1567907840 memInfo.MemFree=1531160
+req.FreeMemory=7224924 req.LogCommitTime=25409529 memory.FreeMemory=1572511744 memInfo.MemFree=1535656
+req.FreeMemory=7241100 req.LogCommitTime=25232769 memory.FreeMemory=1591181312 memInfo.MemFree=1553888
+               7000000                                              1400000000                 1400000
+
+req.FreeMemory=7219232 req.LogCommitTime=2565459  memory.FreeMemory=1561415680 memInfo.MemFree=1524820
+req.FreeMemory=7208780 req.LogCommitTime=2575425  memory.FreeMemory=1550254080 memInfo.MemFree=1513920
+req.FreeMemory=7076636 req.LogCommitTime=13306683 memory.FreeMemory=1413005312 memInfo.MemFree=1379888
+req.FreeMemory=6850800 req.LogCommitTime=34349502 memory.FreeMemory=1181609984 memInfo.MemFree=1153916
+req.FreeMemory=7078016 req.LogCommitTime=34476394 memory.FreeMemory=1413758976 memInfo.MemFree=1380624
+req.FreeMemory=7123180 req.LogCommitTime=35811349 memory.FreeMemory=1459908608 memInfo.MemFree=1425692
+req.FreeMemory=7208980 req.LogCommitTime=69972868 memory.FreeMemory=1548640256 memInfo.MemFree=1512344
+req.FreeMemory=7215232 req.LogCommitTime=49819783 memory.FreeMemory=1554993152 memInfo.MemFree=1518548
+req.FreeMemory=7214336 req.LogCommitTime=39392261 memory.FreeMemory=1554018304 memInfo.MemFree=1517596
+               6900000                                              1200000000                 1200000
+
+
+ 2024-05-28T20:06:53.158Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=210 req.FreeMemory=7219232 req.LogCommitTime=2565459 memory.FreeMemory=1561415680 memory.TotalMemory=8331386880 memInfo.MemFree=1524820 memInfo.MemTotal=8136120
+2024-05-28T20:07:03.054Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=211 req.FreeMemory=7208780 req.LogCommitTime=2575425 memory.FreeMemory=1550254080 memory.TotalMemory=8331386880 memInfo.MemFree=1513920 memInfo.MemTotal=8136120
+2024-05-28T20:07:15.088Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=213 req.FreeMemory=7076636 req.LogCommitTime=13306683 memory.FreeMemory=1413005312 memory.TotalMemory=8331386880 memInfo.MemFree=1379888 memInfo.MemTotal=8136120
+2024-05-28T20:07:27.588Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=215 req.FreeMemory=6850800 req.LogCommitTime=34349502 memory.FreeMemory=1181609984 memory.TotalMemory=8331386880 memInfo.MemFree=1153916 memInfo.MemTotal=8136120
+2024-05-28T20:07:39.788Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=217 req.FreeMemory=7078016 req.LogCommitTime=34476394 memory.FreeMemory=1413758976 memory.TotalMemory=8331386880 memInfo.MemFree=1380624 memInfo.MemTotal=8136120
+2024-05-28T20:07:52.487Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=219 req.FreeMemory=7123180 req.LogCommitTime=35811349 memory.FreeMemory=1459908608 memory.TotalMemory=8331386880 memInfo.MemFree=1425692 memInfo.MemTotal=8136120
+2024-05-28T20:08:05.364Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=221 req.FreeMemory=7208980 req.LogCommitTime=69972868 memory.FreeMemory=1548640256 memory.TotalMemory=8331386880 memInfo.MemFree=1512344 memInfo.MemTotal=8136120
+2024-05-28T20:08:15.216Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=223 req.FreeMemory=7215232 req.LogCommitTime=49819783 memory.FreeMemory=1554993152 memory.TotalMemory=8331386880 memInfo.MemFree=1518548 memInfo.MemTotal=8136120
+2024-05-28T20:08:24.998Z [INFO]  agent.server.raft: setupAppendEntries(): req.LogsCommitedCurrent=224 req.FreeMemory=7214336 req.LogCommitTime=39392261 memory.FreeMemory=1554018304 memory.TotalMemory=8331386880 memInfo.MemFree=1517596 memInfo.MemTotal=8136120
+
+
+237685965
+100388797
+13306683
+
+
+
+
