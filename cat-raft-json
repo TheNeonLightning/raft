@@ -4,8 +4,8 @@ export IMAGE_URL=hashicorp/consul:latest
 docker pull $IMAGE_URL
 docker create --name temp_container $IMAGE_URL
 docker cp /home/tnl/consul/bin/consul temp_container:/bin/consul
-docker commit temp_container theneonlightning7/consul:v22
-docker push theneonlightning7/consul:v22
+docker commit temp_container theneonlightning7/consul:v50
+docker push theneonlightning7/consul:v50
 
 change image version
 
@@ -22,7 +22,7 @@ helm install --values helm/consul-v2-telemetry.yaml consul /home/tnl/Downloads/c
 
 kubectl exec --stdin --tty consul-server-1 -n consul -- /bin/sh
 
-echo '{"HeartbeatTimeout": 2500000000,"ElectionTimeout": 2500000000,"ElectionPolicy": 2,"OppositionPolicy": 1,"OppositionThreshold": 7000000,"BackoffDurSecs": 60}' > /home/consul/raft.json && cd /bin && consul reload
+echo '{"HeartbeatTimeout": 500000000,"ElectionTimeout": 500000000,"ElectionPolicy": 2,"OppositionPolicy": 1,"OppositionThreshold": 7000000,"BackoffDurSecs": 60}' > /home/consul/raft.json && cd /bin && consul reload
 
 OppositionPolicy: FreeMemoryOpp
 3_099_028

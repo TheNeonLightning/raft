@@ -32,6 +32,9 @@ const (
 
 	FreeMemoryElc
 	LogCommitTimeElc
+
+	CpuUsageElc
+	NetworkDelayElc
 )
 
 type electionState struct {
@@ -52,6 +55,9 @@ const (
 
 	FreeMemoryOpp
 	LogCommitTimeOpp
+
+	CpuUsageOpp
+	NetworkDelayOpp
 )
 
 type oppositionState struct {
@@ -60,6 +66,8 @@ type oppositionState struct {
 	backoffTimeout time.Time
 
 	lastNegativeVoteTerm uint64
+
+	cpuTime time.Time
 }
 
 func makeElectionState(rpc RPC, req *RequestVoteRequest) *electionState {
@@ -224,6 +232,7 @@ func (r *Raft) runFollower() {
 	heartbeatTimer := randomTimeout(r.config().HeartbeatTimeout)
 
 	for r.getState() == Follower {
+		r.recordCpuSample()
 		r.mainThreadSaturation.sleeping()
 
 		select {
@@ -348,8 +357,9 @@ func (r *Raft) runCandidate() {
 	r.logger.Info("entering candidate state", "node", r, "term", term)
 	metrics.IncrCounter([]string{"raft", "state", "candidate"}, 1)
 
+	sendTimestamp := time.Now()
 	// Start vote for us, and set a timeout
-	voteCh := r.electSelf()
+	voteCh, voteChInput := r.electSelf()
 
 	// Make sure the leadership transfer flag is reset after each run. Having this
 	// flag will set the field LeadershipTransfer in a RequestVoteRequest to true,
@@ -367,6 +377,7 @@ func (r *Raft) runCandidate() {
 	r.logger.Debug("calculated votes needed", "needed", votesNeeded, "term", term)
 
 	for r.getState() == Candidate {
+		r.recordCpuSample()
 		r.mainThreadSaturation.sleeping()
 
 		select {
@@ -382,6 +393,21 @@ func (r *Raft) runCandidate() {
 				r.setState(Follower)
 				r.setCurrentTerm(vote.Term)
 				return
+			}
+
+			if vote.Resend {
+				r.logger.Info("Resend RequestVoteRequest", "term", vote.Term)
+
+				server := Server{
+					Voter,
+					ServerID(vote.ID),
+					ServerAddress(vote.Addr),
+				}
+
+				req := r.setupRequestVote()
+				req.NetworkDelay = uint64(time.Now().Sub(sendTimestamp))
+				sendTimestamp = time.Now()
+				r.askPeer(server, req, voteChInput)
 			}
 
 			// Check if the vote is granted
@@ -617,6 +643,7 @@ func (r *Raft) startStopReplication() {
 			r.logger.Info("added peer, starting replication", "peer", server.ID)
 			s = &followerReplication{
 				peer:                server,
+				networkDelay:        0,
 				commitment:          r.leaderState.commitment,
 				stopCh:              make(chan uint64, 1),
 				triggerCh:           make(chan struct{}, 1),
@@ -698,6 +725,7 @@ func (r *Raft) leaderLoop() {
 	lease := time.After(r.config().LeaderLeaseTimeout)
 
 	for r.getState() == Leader {
+		r.recordCpuSample()
 		r.mainThreadSaturation.sleeping()
 
 		select {
@@ -1614,6 +1642,9 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 	// TODO do we need to check follower state (is it determined by a check above?)
 	// TODO might not reach this section - if we return from function earlier
+	zeroTimestamp := time.Time{}
+	metrics.MeasureSince([]string{"plus", "backoffDuration1"}, zeroTimestamp.Add(time.Now().Sub(r.oppositionState.backoffTimeout)+r.oppositionState.backoffCurrDur))
+	metrics.AddSample([]string{"plus", "backoffDuration2"}, float32(max(uint64(r.oppositionState.backoffTimeout.Sub(time.Now())), 0)))
 	if a.Term > r.oppositionState.lastNegativeVoteTerm && time.Now().After(r.oppositionState.backoffTimeout) &&
 		(a.LogsCommitedCurrent != 0 || a.FreeMemory != 0 || a.LogCommitTime != 0) {
 		var leaderPerf uint64
@@ -1625,14 +1656,22 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			oppPolicyStr = "LogsCommitedCurrentOpp"
 			leaderPerf = a.LogsCommitedCurrent
 			resp.NegativeVote = a.LogsCommitedCurrent > oppThreshold
-		case FreeMemoryOpp:
-			oppPolicyStr = "FreeMemoryOpp"
-			leaderPerf = a.FreeMemory
-			resp.NegativeVote = a.FreeMemory < oppThreshold
 		case LogCommitTimeOpp:
 			oppPolicyStr = "LogCommitTimeOpp"
 			leaderPerf = a.LogCommitTime
 			resp.NegativeVote = a.LogCommitTime > oppThreshold
+		case FreeMemoryOpp:
+			oppPolicyStr = "FreeMemoryOpp"
+			leaderPerf = a.FreeMemory
+			resp.NegativeVote = a.FreeMemory < oppThreshold
+		case CpuUsageOpp:
+			oppPolicyStr = "CpuUsageOpp"
+			leaderPerf = a.CpuUsage
+			resp.NegativeVote = a.CpuUsage > oppThreshold
+		case NetworkDelayOpp:
+			oppPolicyStr = "NetworkDelayOpp"
+			leaderPerf = a.NetworkDelay
+			resp.NegativeVote = a.NetworkDelay > oppThreshold
 
 		default:
 			oppPolicyStr = "LogsCommitedCurrentOpp"
@@ -1651,10 +1690,10 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			} else if r.oppositionState.backoffCurrDur > r.oppositionState.backoffInitDur {
 				r.oppositionState.backoffCurrDur /= 2
 			}
-			r.logger.Info("[OPPOSITION] Pause sending negative votes", "backoffCurrDur",
-				r.oppositionState.backoffCurrDur, "backoffTimeout", r.oppositionState.backoffTimeout)
 			r.oppositionState.backoffTimeout = time.Now().Add(r.oppositionState.backoffCurrDur)
 			r.oppositionState.lastNegativeVoteTerm = a.Term
+			r.logger.Info("[OPPOSITION] Pause sending negative votes", "backoffCurrDur",
+				r.oppositionState.backoffCurrDur, "backoffTimeout", r.oppositionState.backoffTimeout)
 		}
 	}
 
@@ -1686,13 +1725,14 @@ func (r *Raft) processConfigurationLogEntry(entry *Log) error {
 // requestVote is invoked when we get a request vote RPC call.
 func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	r.logger.Info("[ELECTION] requestVote() invoked", "term", req.Term)
-	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
+	startTimestamp := time.Now()
+	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, startTimestamp)
 	r.observe(*req)
 
 	denyVote := true
 	defer func() {
 		if denyVote {
-			r.sendDeniedVote(rpc, req)
+			r.sendDeniedVote(rpc, req, false)
 		}
 	}()
 
@@ -1721,6 +1761,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 			return
 		}
 	}
+	//time.Since(r.LastContact()) < r.config().HeartbeatTimeout
 	if leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != "" && leaderAddr != candidate && !req.LeadershipTransfer {
 		r.logger.Warn("rejecting vote request since we have a leader",
 			"from", candidate,
@@ -1774,7 +1815,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 			r.logger.Warn("duplicate requestVote from", "candidate", candidate)
 			// TODO sendGrantedVote() does persistVote() and lastContact() which were not here before
 			denyVote = false
-			r.sendGrantedVote(rpc, req)
+			r.sendGrantedVote(rpc, req, startTimestamp)
 		}
 		return
 	}
@@ -1798,6 +1839,13 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 
 	denyVote = false
+
+	if r.config().ElectionPolicy == NetworkDelayElc && req.NetworkDelay == 0 {
+		r.sendDeniedVote(rpc, req, true)
+		return
+	}
+
+	r.setLastContact() // TODO tmp solution
 	if r.electionState == nil || req.Term > r.electionState.electionTerm {
 
 		if r.electionState == nil {
@@ -1820,7 +1868,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 		r.logger.Info("[ELECTION] adding vote to current election", "term", req.Term, "voteCount", 1)
 		r.electionState = makeElectionState(rpc, req)
-		go r.runElectionAfterDelay(*r.electionState)
+		go r.runElectionAfterDelay(*r.electionState, startTimestamp)
 	} else {
 		r.electionState.electionActive.L.Lock()
 
@@ -1839,8 +1887,8 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 }
 
-func (r *Raft) runElectionAfterDelay(election electionState) {
-	go r.runElection(election)
+func (r *Raft) runElectionAfterDelay(election electionState, startTimestamp time.Time) {
+	go r.runElection(election, startTimestamp)
 	time.Sleep(r.config().ElectionTimeout / 3)
 
 	election.electionActive.L.Lock()
@@ -1854,7 +1902,7 @@ func (r *Raft) runElectionAfterDelay(election electionState) {
 // TODO do I need to construct resp for every candidate?
 // TODO use term from electionState
 // TODO might use goFunc to start two goroutines
-func (r *Raft) runElection(election electionState) {
+func (r *Raft) runElection(election electionState, startTimestamp time.Time) {
 	election.electionActive.L.Lock()
 	defer election.electionActive.L.Unlock()
 
@@ -1867,7 +1915,7 @@ func (r *Raft) runElection(election electionState) {
 	if !*election.electionRelevant {
 		r.logger.Info("[ELECTION] election is no longer relevant", "term", election.electionTerm)
 		for index := 0; index < len(*election.candidates); index++ {
-			r.sendDeniedVote((*election.candidatesRPCs)[(*election.candidates)[index]], (*election.candidates)[index])
+			r.sendDeniedVote((*election.candidatesRPCs)[(*election.candidates)[index]], (*election.candidates)[index], false)
 		}
 		return
 	}
@@ -1883,6 +1931,10 @@ func (r *Raft) runElection(election electionState) {
 			return (*election.candidates)[left].FreeMemory > (*election.candidates)[right].FreeMemory
 		case LogCommitTimeElc:
 			return (*election.candidates)[left].LogCommitTime < (*election.candidates)[right].LogCommitTime
+		case CpuUsageElc:
+			return (*election.candidates)[left].CpuUsage < (*election.candidates)[right].CpuUsage
+		case NetworkDelayElc:
+			return (*election.candidates)[left].NetworkDelay < (*election.candidates)[right].NetworkDelay
 
 		default:
 			return (*election.candidates)[left].ElectionsWon > (*election.candidates)[right].ElectionsWon
@@ -1893,10 +1945,10 @@ func (r *Raft) runElection(election electionState) {
 	var winnerValue uint64
 	switch r.config().ElectionPolicy {
 	case ElectionsWonElc:
-		electionPolicyStr = "ElectionsWon"
+		electionPolicyStr = "ElectionsWonElc"
 		winnerValue = (*election.candidates)[0].ElectionsWon
 	case LogsCommitedTotalElc:
-		electionPolicyStr = "LogsCommitedTotal"
+		electionPolicyStr = "LogsCommitedTotalElc"
 		winnerValue = (*election.candidates)[0].LogsCommitedTotal
 	case FreeMemoryElc:
 		electionPolicyStr = "FreeMemoryElc"
@@ -1904,6 +1956,12 @@ func (r *Raft) runElection(election electionState) {
 	case LogCommitTimeElc:
 		electionPolicyStr = "LogCommitTimeElc"
 		winnerValue = (*election.candidates)[0].LogCommitTime
+	case CpuUsageElc:
+		electionPolicyStr = "CpuUsageElc"
+		winnerValue = (*election.candidates)[0].CpuUsage
+	case NetworkDelayElc:
+		electionPolicyStr = "NetworkDelayElc"
+		winnerValue = (*election.candidates)[0].NetworkDelay
 
 	default:
 		electionPolicyStr = "ElectionsWon"
@@ -1913,18 +1971,19 @@ func (r *Raft) runElection(election electionState) {
 	r.logger.Info("[ELECTION] best candidate determined", "term", election.electionTerm, "electionPolicy", electionPolicyStr, "winnerValue", winnerValue)
 
 	for index := 1; index < len(*election.candidates); index++ {
-		r.sendDeniedVote((*election.candidatesRPCs)[(*election.candidates)[index]], (*election.candidates)[index])
+		r.sendDeniedVote((*election.candidatesRPCs)[(*election.candidates)[index]], (*election.candidates)[index], false)
 	}
-	r.sendGrantedVote((*election.candidatesRPCs)[(*election.candidates)[0]], (*election.candidates)[0])
+	r.sendGrantedVote((*election.candidatesRPCs)[(*election.candidates)[0]], (*election.candidates)[0], startTimestamp)
 
 	// TODO clear electionState
 }
 
-func (r *Raft) sendDeniedVote(rpc RPC, req *RequestVoteRequest) {
+func (r *Raft) sendDeniedVote(rpc RPC, req *RequestVoteRequest, resend bool) {
 	resp := &RequestVoteResponse{
 		RPCHeader: r.getRPCHeader(),
 		Term:      req.Term,
 		Granted:   false,
+		Resend:    resend,
 	}
 
 	// Version 0 servers will panic unless the peers is present. It's only
@@ -1938,7 +1997,7 @@ func (r *Raft) sendDeniedVote(rpc RPC, req *RequestVoteRequest) {
 	rpc.Respond(resp, rpcErr)
 }
 
-func (r *Raft) sendGrantedVote(rpc RPC, req *RequestVoteRequest) {
+func (r *Raft) sendGrantedVote(rpc RPC, req *RequestVoteRequest, startTimestamp time.Time) {
 	resp := &RequestVoteResponse{
 		RPCHeader: r.getRPCHeader(),
 		Term:      req.Term,
@@ -1970,6 +2029,8 @@ func (r *Raft) sendGrantedVote(rpc RPC, req *RequestVoteRequest) {
 	r.logger.Info("[ELECTION] sending granted vote", "term", resp.Term)
 	var rpcErr error
 	rpc.Respond(resp, rpcErr)
+
+	metrics.MeasureSince([]string{"plus", "requestVote"}, startTimestamp)
 }
 
 // installSnapshot is invoked when we get a InstallSnapshot RPC call.
@@ -2129,25 +2190,14 @@ type voteResult struct {
 	voterID ServerID
 }
 
-// electSelf is used to send a RequestVote RPC to all peers, and vote for
-// ourself. This has the side affecting of incrementing the current term. The
-// response channel returned is used to wait for all the responses (including a
-// vote for ourself). This must only be called from the main thread.
-func (r *Raft) electSelf() <-chan *voteResult {
-	// Create a response channel
-	respCh := make(chan *voteResult, len(r.configurations.latest.Servers))
-
-	// Increment the term
-	r.setCurrentTerm(r.getCurrentTerm() + 1)
-
-	// Construct the request
+func (r *Raft) setupRequestVote() *RequestVoteRequest {
 	memInfo, err := linuxproc.ReadMemInfo("/proc/meminfo")
 	if err != nil {
 		r.logger.Error("failed to collect memory info for requestVote RPC", "error", err)
 	}
 
 	lastIdx, lastTerm := r.getLastEntry()
-	req := &RequestVoteRequest{
+	return &RequestVoteRequest{
 		RPCHeader: r.getRPCHeader(),
 		Term:      r.getCurrentTerm(),
 		// this is needed for retro compatibility, before RPCHeader.Addr was added
@@ -2158,26 +2208,42 @@ func (r *Raft) electSelf() <-chan *voteResult {
 		LogsCommitedTotal:  r.getLogsCommitedTotal(),
 		FreeMemory:         memInfo.MemAvailable,
 		LogCommitTime:      uint64(r.getLogCommitTime()),
+		CpuUsage:           r.getCpuUsage(),
+		NetworkDelay:       0,
 		LeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),
 	}
+}
 
-	// Construct a function to ask for a vote
-	askPeer := func(peer Server) {
-		r.goFunc(func() {
-			defer metrics.MeasureSince([]string{"raft", "candidate", "electSelf"}, time.Now())
-			resp := &voteResult{voterID: peer.ID}
-			err := r.trans.RequestVote(peer.ID, peer.Address, req, &resp.RequestVoteResponse)
-			if err != nil {
-				r.logger.Error("failed to make requestVote RPC",
-					"target", peer,
-					"error", err,
-					"term", req.Term)
-				resp.Term = req.Term
-				resp.Granted = false
-			}
-			respCh <- resp
-		})
-	}
+func (r *Raft) askPeer(peer Server, req *RequestVoteRequest, respCh chan *voteResult) {
+	r.goFunc(func() {
+		defer metrics.MeasureSince([]string{"raft", "candidate", "electSelf"}, time.Now())
+		resp := &voteResult{voterID: peer.ID}
+		err := r.trans.RequestVote(peer.ID, peer.Address, req, &resp.RequestVoteResponse)
+		if err != nil {
+			r.logger.Error("failed to make requestVote RPC",
+				"target", peer,
+				"error", err,
+				"term", req.Term)
+			resp.Term = req.Term
+			resp.Granted = false
+		}
+		respCh <- resp
+	})
+}
+
+// electSelf is used to send a RequestVote RPC to all peers, and vote for
+// ourself. This has the side affecting of incrementing the current term. The
+// response channel returned is used to wait for all the responses (including a
+// vote for ourself). This must only be called from the main thread.
+func (r *Raft) electSelf() (<-chan *voteResult, chan *voteResult) {
+	// Create a response channel
+	respCh := make(chan *voteResult, len(r.configurations.latest.Servers)*2)
+
+	// Increment the term
+	r.setCurrentTerm(r.getCurrentTerm() + 1)
+
+	// Construct the request
+	req := r.setupRequestVote()
 
 	// For each peer, request a vote
 	for _, server := range r.configurations.latest.Servers {
@@ -2187,7 +2253,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 				// Persist a vote for ourselves
 				if err := r.persistVote(req.Term, req.RPCHeader.Addr); err != nil {
 					r.logger.Error("failed to persist vote", "error", err)
-					return nil
+					return nil, nil
 				}
 				// Include our own vote
 				respCh <- &voteResult{
@@ -2200,12 +2266,12 @@ func (r *Raft) electSelf() <-chan *voteResult {
 				}
 			} else {
 				r.logger.Debug("asking for vote", "term", req.Term, "from", server.ID, "address", server.Address)
-				askPeer(server)
+				r.askPeer(server, req, respCh)
 			}
 		}
 	}
 
-	return respCh
+	return respCh, respCh
 }
 
 // persistVote is used to persist our vote for safety.

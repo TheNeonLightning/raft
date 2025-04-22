@@ -4,8 +4,10 @@
 package raft
 
 import (
+	linuxproc "github.com/c9s/goprocinfo/linux"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // RaftState captures the state of a Raft node: Follower, Candidate, Leader,
@@ -75,6 +77,11 @@ type raftState struct {
 
 	logCommitTimeBuffer []int64
 	avgLogCommitTime    int64
+
+	cpuSampleTime time.Time
+	cpuIdle       uint64
+	cpuTotal      uint64
+	cpuUsage      uint64
 
 	// Tracks running goroutines
 	routinesGroup sync.WaitGroup
@@ -156,6 +163,50 @@ func (r *raftState) addLogCommitTime(logCommitTime int64) {
 
 func (r *raftState) getLogCommitTime() int64 {
 	return atomic.LoadInt64(&r.avgLogCommitTime)
+}
+
+func (r *raftState) recordCpuSample() {
+	idle, total := r.getCpuSample()
+	newSampleTime := time.Now()
+	if r.cpuSampleTime.Add(time.Duration(3) * time.Second).After(newSampleTime) {
+		return
+	}
+
+	idleTicks := float64(idle - r.cpuIdle)
+	totalTicks := float64(total - r.cpuTotal)
+	usage := 100 * (totalTicks - idleTicks) / totalTicks
+
+	atomic.StoreUint64(&r.cpuUsage, uint64(usage))
+
+	r.cpuIdle = idle
+	r.cpuTotal = total
+	r.cpuSampleTime = newSampleTime
+}
+
+func (r *raftState) getCpuUsage() uint64 {
+	return atomic.LoadUint64(&r.cpuUsage)
+}
+
+func (r *raftState) getCpuSample() (idle uint64, total uint64) {
+	cpuInfo, err := linuxproc.ReadStat("/proc/stat")
+	if err != nil {
+		return
+	}
+	cpuInfoAll := cpuInfo.CPUStatAll
+
+	total = cpuInfoAll.User +
+		cpuInfoAll.Nice +
+		cpuInfoAll.System +
+		cpuInfoAll.Idle +
+		cpuInfoAll.IOWait +
+		cpuInfoAll.IRQ +
+		cpuInfoAll.SoftIRQ +
+		cpuInfoAll.Steal +
+		cpuInfoAll.Guest +
+		cpuInfoAll.GuestNice
+
+	idle = cpuInfoAll.Idle
+	return
 }
 
 func (r *raftState) getLastSnapshot() (index, term uint64) {

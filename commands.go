@@ -46,6 +46,8 @@ type AppendEntriesRequest struct {
 	LogsCommitedCurrent uint64
 	LogCommitTime       uint64
 	FreeMemory          uint64
+	CpuUsage            uint64
+	NetworkDelay        uint64
 }
 
 // GetRPCHeader - See WithRPCHeader.
@@ -98,6 +100,8 @@ type RequestVoteRequest struct {
 	LogsCommitedTotal uint64
 	FreeMemory        uint64
 	LogCommitTime     uint64
+	CpuUsage          uint64
+	NetworkDelay      uint64
 
 	// Used to indicate to peers if this vote was triggered by a leadership
 	// transfer. It is required for leadership transfer to work, because servers
@@ -124,6 +128,8 @@ type RequestVoteResponse struct {
 
 	// Is the vote granted.
 	Granted bool
+
+	Resend bool
 }
 
 // GetRPCHeader - See WithRPCHeader.

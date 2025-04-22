@@ -326,11 +326,11 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 func DefaultConfig() *Config {
 	return &Config{
 		ProtocolVersion:     ProtocolVersionMax,
-		HeartbeatTimeout:    500 * time.Millisecond,
-		ElectionTimeout:     500 * time.Millisecond,
-		ElectionPolicy:      LogCommitTimeElc,
-		OppositionPolicy:    LogCommitTimeOpp,
-		OppositionThreshold: 200000000,
+		HeartbeatTimeout:    100 * time.Millisecond,
+		ElectionTimeout:     100 * time.Millisecond,
+		ElectionPolicy:      FreeMemoryElc,
+		OppositionPolicy:    NetworkDelayOpp,
+		OppositionThreshold: 500_000_000,
 		BackoffDurSecs:      60,
 		CommitTimeout:       50 * time.Millisecond,
 		MaxAppendEntries:    64,
@@ -338,7 +338,7 @@ func DefaultConfig() *Config {
 		TrailingLogs:        10240,
 		SnapshotInterval:    120 * time.Second,
 		SnapshotThreshold:   8192,
-		LeaderLeaseTimeout:  500 * time.Millisecond,
+		LeaderLeaseTimeout:  100 * time.Millisecond,
 		LogLevel:            "DEBUG",
 	}
 }

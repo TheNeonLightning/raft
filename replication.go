@@ -6,7 +6,6 @@ package raft
 import (
 	"errors"
 	"fmt"
-	"github.com/pbnjay/memory"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +48,8 @@ type followerReplication struct {
 	peer Server
 	// peerLock protects 'peer'
 	peerLock sync.RWMutex
+
+	networkDelay time.Duration
 
 	// commitment tracks the entries acknowledged by followers so that the
 	// leader's commit index can advance. It is updated on successful
@@ -236,6 +237,7 @@ START:
 		return
 	}
 	appendStats(string(peer.ID), start, float32(len(req.Entries)))
+	s.networkDelay = time.Now().Sub(start)
 
 	// Check for a newer term, stop running
 	if resp.Term > req.Term {
@@ -542,6 +544,7 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 
 			req, resp := ready.Request(), ready.Response()
 			appendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)))
+			s.networkDelay = time.Now().Sub(ready.Start())
 
 			// Check for a newer term, stop running
 			if resp.Term > req.Term {
@@ -591,12 +594,21 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequ
 	req.FreeMemory = memInfo.MemAvailable
 	req.LogCommitTime = uint64(r.getLogCommitTime())
 
+	req.CpuUsage = r.getCpuUsage()
+	req.NetworkDelay = uint64(s.networkDelay)
+
 	logCounter += 1
 	if logCounter%500 == 0 {
 		r.logger.Info("setupAppendEntries()", "req.LogsCommitedCurrent", req.LogsCommitedCurrent,
 			"req.FreeMemory", req.FreeMemory, "req.LogCommitTime", req.LogCommitTime,
-			"memory.FreeMemory", memory.FreeMemory(), "memInfo.MemFree", memInfo.MemFree)
+			"req.CpuUsage", req.CpuUsage, "req.NetworkDelay", req.NetworkDelay)
 	}
+
+	metrics.AddSample([]string{"plus", "FreeMemory"}, float32(req.LogsCommitedCurrent))
+	metrics.AddSample([]string{"plus", "FreeMemory"}, float32(req.FreeMemory))
+	metrics.AddSample([]string{"plus", "LogCommitTime"}, float32(req.LogCommitTime))
+	metrics.AddSample([]string{"plus", "CpuUsage"}, float32(req.CpuUsage))
+	metrics.AddSample([]string{"plus", "NetworkDelay"}, float32(req.NetworkDelay))
 
 	if err := r.setPreviousLog(req, nextIndex); err != nil {
 		return err
@@ -676,6 +688,7 @@ func (r *Raft) handleNegativeVote(s *followerReplication) (shouldStop bool) {
 	r.logger.Info("[OPPOSITION] Leader received negative vote", "opposition size", oppositionSize)
 	if int(oppositionSize) >= r.quorumSize() {
 		r.logger.Info("[OPPOSITION] Opposition reached quorum, leader stepping down")
+		r.LastContact()
 		s.notifyAll(false) // No longer leader
 		asyncNotifyCh(s.stepDown)
 		return true

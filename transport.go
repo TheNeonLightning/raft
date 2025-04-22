@@ -46,6 +46,8 @@ type Transport interface {
 	// RequestVote sends the appropriate RPC to the target node.
 	RequestVote(id ServerID, target ServerAddress, args *RequestVoteRequest, resp *RequestVoteResponse) error
 
+	//MeasureNetwork(id ServerID, target ServerAddress, args *NetworkMeasurementRequest, resp *NetworkMeasurementResponse) error
+
 	// InstallSnapshot is used to push a snapshot down to a follower. The data is read from
 	// the ReadCloser and streamed to the client.
 	InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error
